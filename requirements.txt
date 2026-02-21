@@ -1,0 +1,26 @@
+# Core
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+scipy>=1.7.0
+
+# Deep learning
+torch>=1.12.0
+
+# Imbalanced learning
+imbalanced-learn>=0.9.0
+
+# Synthetic data baselines
+sdv>=1.0.0
+ctgan>=0.7.0
+
+# Gradient boosting classifiers
+xgboost>=1.5.0
+
+# Dataset loading
+ucimlrepo>=0.0.3
+openml>=0.12.0
+
+# Optional (visualization)
+matplotlib>=3.4.0
+seaborn>=0.11.0
