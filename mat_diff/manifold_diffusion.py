@@ -80,12 +80,23 @@ class MATDiffPipeline:
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
         self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
 
-    def _q_sample(self, x_start, t, noise=None):
+    def _q_sample(self, x_start, t, noise=None, curvature=None):
+        """Forward diffusion with curvature-adaptive noise for minority protection."""
         if noise is None:
             noise = torch.randn_like(x_start)
         t = torch.clamp(t, 0, self.total_timesteps - 1)
+        
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        
+        # CRITICAL: Reduce noise for high-curvature (minority) samples
+        if curvature is not None:
+            # Normalize curvature to [0, 1]
+            curv_norm = curvature.view(-1, 1)
+            # High curvature = reduce noise by up to 30%
+            noise_scale = 1.0 - 0.3 * curv_norm
+            sqrt_one_minus = sqrt_one_minus * noise_scale
+        
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
     def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
@@ -257,7 +268,7 @@ class MATDiffPipeline:
                 t = torch.clamp(t, 0, self.total_timesteps - 1)
 
                 noise = torch.randn_like(x_batch)
-                x_noisy = self._q_sample(x_batch, t, noise)
+                x_noisy = self._q_sample(x_batch, t, noise, curvature=curv_batch)
 
                 # Classifier-free guidance training: drop labels 10% of the time
                 drop_mask = torch.rand(len(x_batch), device=self.device) < 0.1
@@ -513,6 +524,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
