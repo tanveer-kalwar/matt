@@ -80,52 +80,73 @@ class GeodesicAttentionBlock(nn.Module):
             self.L.data[h] = L_h
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-sample attention: each sample attends to its own features.
+        """Cross-sample Geodesic Attention with Mahalanobis kernel.
         
-        For tabular diffusion, samples are independently denoised.
-        Instead of B×B pairwise attention, we use per-sample self-attention
-        where each sample's n_heads attend to each other within that sample.
-        
-        Memory: O(B * n_heads^2) instead of O(B^2 * n_heads * d_head)
+        Memory-efficient implementation with chunking for large batches.
         """
-        B = x.shape[0]
+        B, D = x.shape
         residual = x
 
-        # Project to Q, K, V: (B, n_heads, d_head)
+        # Project to Q, K, V
         Q = self.W_q(x).view(B, self.n_heads, self.d_head)
         K = self.W_k(x).view(B, self.n_heads, self.d_head)
         V = self.W_v(x).view(B, self.n_heads, self.d_head)
 
-        # Compute per-sample attention: heads attend to each other within each sample
-        # Q: (B, n_heads, d_head) -> (B, n_heads, 1, d_head) for broadcasting
-        # K: (B, n_heads, d_head) -> (B, 1, n_heads, d_head) for broadcasting
-        Q_exp = Q.unsqueeze(2)  # (B, n_heads, 1, d_head)
-        K_exp = K.unsqueeze(1)  # (B, 1, n_heads, d_head)
+        # Transpose for multi-head processing
+        Q = Q.transpose(0, 1)  # (n_heads, B, d_head)
+        K = K.transpose(0, 1)
+        V = V.transpose(0, 1)
+
+        # For small batches, use full attention
+        if B <= 128:
+            outputs = []
+            for h in range(self.n_heads):
+                Q_h = Q[h]  # (B, d_head)
+                K_h = K[h]
+                V_h = V[h]
+                
+                # Mahalanobis distance: (B, B)
+                diff = Q_h.unsqueeze(1) - K_h.unsqueeze(0)  # (B, B, d_head)
+                diff_t = torch.matmul(diff, self.L[h])
+                sq_dist = (diff_t ** 2).sum(dim=-1)
+                
+                # Attention
+                scale = math.sqrt(self.d_head)
+                attn = F.softmax(-sq_dist / scale, dim=1)
+                attn = self.dropout(attn)
+                
+                out_h = torch.matmul(attn, V_h)
+                outputs.append(out_h)
         
-        # diff: (B, n_heads, n_heads, d_head) - O(B * n_heads^2 * d_head)
-        diff = Q_exp - K_exp
+        # For large batches, use chunked attention to save memory
+        else:
+            chunk_size = 64
+            outputs = []
+            
+            for h in range(self.n_heads):
+                Q_h = Q[h]
+                K_h = K[h]
+                V_h = V[h]
+                
+                out_chunks = []
+                for i in range(0, B, chunk_size):
+                    Q_chunk = Q_h[i:i+chunk_size]
+                    
+                    # Compute attention for this chunk
+                    diff = Q_chunk.unsqueeze(1) - K_h.unsqueeze(0)
+                    diff_t = torch.matmul(diff, self.L[h])
+                    sq_dist = (diff_t ** 2).sum(dim=-1)
+                    
+                    attn = F.softmax(-sq_dist / math.sqrt(self.d_head), dim=1)
+                    attn = self.dropout(attn)
+                    
+                    out_chunk = torch.matmul(attn, V_h)
+                    out_chunks.append(out_chunk)
+                
+                outputs.append(torch.cat(out_chunks, dim=0))
         
-        # Apply Mahalanobis metric via Cholesky factor L
-        # L: (n_heads, d_head, d_head)
-        # diff: (B, query_head, key_head, d_head)
-        # We need to apply L based on the key_head dimension
-        diff_transformed = torch.einsum('bqkd,kdf->bqkf', diff, self.L)
-        
-        # Squared distance: (B, n_heads, n_heads)
-        sq_dist = (diff_transformed ** 2).sum(dim=-1)
-        
-        # Attention scores: softmax over key heads
-        scale = math.sqrt(self.d_head)
-        attn_logits = -sq_dist / scale
-        attn = F.softmax(attn_logits, dim=2)  # softmax over key dimension
-        attn = self.dropout(attn)
-        
-        # Weighted sum of values: (B, n_heads, n_heads) @ (B, n_heads, d_head)
-        # attn: (B, query_head, key_head), V: (B, key_head, d_head)
-        out = torch.einsum('bqk,bkd->bqd', attn, V)  # (B, n_heads, d_head)
-        
-        # Reshape and project
-        out = out.reshape(B, self.d_model)
+        # Concatenate heads and project
+        out = torch.cat(outputs, dim=1)  # (B, d_model)
         out = self.W_out(out)
-        out = self.layer_norm(out + residual)
-        return out
+        return self.layer_norm(out + residual)
+
