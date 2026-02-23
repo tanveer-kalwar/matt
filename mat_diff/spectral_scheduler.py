@@ -149,10 +149,27 @@ class SpectralCurriculumScheduler:
         return (t_low, t_high)
 
     def sample_timesteps(
-        self, batch_size: int, epoch: int, total_epochs: int, device: str = "cpu"
-    ) -> torch.Tensor:
-        t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
-        t_low = max(0, t_low)
-        t_high = max(t_low + 1, t_high)
-        t = torch.randint(t_low, t_high, (batch_size,), device=device)
-        return torch.clamp(t, 0, self.total_timesteps - 1)
+    self, batch_size: int, epoch: int, total_epochs: int, device: str = "cpu"
+) -> torch.Tensor:
+    t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
+    t_low = max(0, t_low)
+    t_high = max(t_low + 1, t_high)
+    
+    # Base uniform sampling
+    t = torch.randint(t_low, t_high, (batch_size,), device=device)
+    
+    # CRITICAL: Bias toward phase-appropriate timesteps for curriculum
+    if self.n_phases > 1:
+        phase = self.get_phase_for_epoch(epoch, total_epochs)
+        epochs_per_phase = max(1, total_epochs // self.n_phases)
+        progress = (epoch % epochs_per_phase) / epochs_per_phase
+        
+        if phase == 0:  # Early phase: bias toward high timesteps (coarse)
+            bias = int((1.0 - progress) * 0.3 * (t_high - t_low))
+            t = torch.clamp(t + bias, t_low, t_high - 1)
+        elif phase == self.n_phases - 1:  # Late phase: bias toward low timesteps (fine)
+            bias = int(progress * 0.3 * (t_high - t_low))
+            t = torch.clamp(t - bias, t_low, t_high - 1)
+    
+    return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
