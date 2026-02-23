@@ -228,9 +228,6 @@ class MATDiffPipeline:
             weight_per_sample[i] = loss_weights[int(label)]
 
         self.denoiser.train()
-        best_loss = float("inf")
-        patience = 20
-        patience_counter = 0
 
         # Compute per-class indices for balanced sampling
         class_indices = {}
@@ -245,8 +242,8 @@ class MATDiffPipeline:
                 cidx = class_indices[c]
                 if len(cidx) == 0:
                     continue
-                # Sample 5x max_class_size for MAXIMUM minority coverage
-                n_samples = max_class_size * 5
+                # Sample 2x for balanced minority coverage without overfitting
+                n_samples = max_class_size * 2
                 sampled = cidx[torch.randint(0, len(cidx), (n_samples,), device=self.device)]
                 balanced_idx.append(sampled)
             balanced_idx = torch.cat(balanced_idx)
@@ -286,8 +283,10 @@ class MATDiffPipeline:
 
                 optimizer.zero_grad()
                 loss.backward()
+                # Adaptive gradient clipping for high-curvature datasets
+                max_norm = 2.0 if max(self.fisher.curvatures.values()) > 500 else 1.0
                 torch.nn.utils.clip_grad_norm_(
-                    self.denoiser.parameters(), max_norm=1.0
+                self.denoiser.parameters(), max_norm=max_norm
                 )
                 optimizer.step()
 
@@ -297,9 +296,6 @@ class MATDiffPipeline:
             lr_scheduler.step()
             avg_loss = epoch_loss / max(1, n_batches)
             self.train_losses.append(avg_loss)
-
-            if avg_loss < best_loss:
-                best_loss = avg_loss
 
             if verbose and ((epoch + 1) % 50 == 0 or epoch == 0):
                 phase = self.scheduler.get_phase_for_epoch(epoch, epochs)
@@ -326,18 +322,17 @@ class MATDiffPipeline:
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
-
+    
         # Conditional prediction
         noise_pred_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-
+    
         # Unconditional prediction (null class token)
         y_uncond = torch.full_like(y, self.n_classes)
         curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
         noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
-
+    
         # Guided prediction
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
 
@@ -418,10 +413,10 @@ class MATDiffPipeline:
         return np.vstack(all_samples)
 
     def sample(self, n_per_class=None):
-        """Generate synthetic samples with Riemannian privacy filtering."""
+        """Generate synthetic samples in batches for quality and memory efficiency."""
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
-
+    
         if n_per_class is None:
             class_counts = dict(zip(*np.unique(self.y_train, return_counts=True)))
             majority_count = max(class_counts.values())
@@ -438,17 +433,18 @@ class MATDiffPipeline:
                     if c in alloc:
                         deficit = int(majority_count - class_counts.get(c, 0))
                         n_per_class[c] = max(alloc[c], deficit)
-
+    
         all_X, all_y = [], []
+        MAX_BATCH = 512  # Maximum samples per batch to prevent OOM
+        
         for class_label, n_needed in n_per_class.items():
             if n_needed <= 0:
                 continue
             print(f"  Sampling class {class_label}: {n_needed} samples...")
-            # Generate samples
-            self.denoiser.eval()
-            x_t = torch.randn(n_needed, self.n_features, device=self.device)
-            y_cond = torch.full((n_needed,), class_label, device=self.device, dtype=torch.long)
             
+            self.denoiser.eval()
+            
+            # Compute curvature normalization once
             import math
             curv_val = self.fisher.curvatures.get(class_label, 1.0)
             all_curvs = list(self.fisher.curvatures.values())
@@ -456,19 +452,36 @@ class MATDiffPipeline:
             log_min = min(log_curvs)
             log_range = max(log_curvs) - log_min
             curv_norm = (math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
-            curvature = torch.full((n_needed,), curv_norm, device=self.device, dtype=torch.float32)
-
-            for t in reversed(range(self.total_timesteps)):
-                x_t = self._p_sample_step(x_t, t, y=y_cond, curvature=curvature)
-
-            X_syn = x_t.cpu().numpy()
             
+            # Generate in batches
+            n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
+            class_samples = []
+            
+            for batch_idx in range(n_batches):
+                batch_size = min(MAX_BATCH, n_needed - len(class_samples))
+                
+                # Initialize noise
+                x_t = torch.randn(batch_size, self.n_features, device=self.device)
+                y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
+                curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
+    
+                # Reverse diffusion
+                for t in reversed(range(self.total_timesteps)):
+                    x_t = self._p_sample_step(x_t, t, y=y_cond, curvature=curvature)
+                
+                class_samples.append(x_t.cpu().numpy())
+                
+                # Clear GPU cache every 5 batches
+                if batch_idx % 5 == 0 and batch_idx > 0:
+                    torch.cuda.empty_cache()
+            
+            X_syn = np.vstack(class_samples)
             all_X.append(X_syn)
             all_y.append(np.full(len(X_syn), class_label))
-
+    
         if not all_X:
             return np.empty((0, self.n_features)), np.empty(0, dtype=int)
-
+    
         return np.vstack(all_X), np.concatenate(all_y)
 
     def save(self, path: str):
@@ -524,6 +537,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
