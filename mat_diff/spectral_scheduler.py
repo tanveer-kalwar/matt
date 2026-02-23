@@ -171,7 +171,10 @@ class SpectralCurriculumScheduler:
                     bias = int(progress * 0.3 * (t_high - t_low))
                     t = torch.clamp(t - bias, 0, self.total_timesteps - 1)
 
-        return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+                    
+
+            return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
