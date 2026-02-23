@@ -358,71 +358,6 @@ class MATDiffPipeline:
         else:
             return mean
 
-    @torch.no_grad()
-    def _sample_class(self, class_label, n_samples, oversample_factor=1, max_batch_size=512):
-        """Generate raw synthetic samples for a single class with memory-safe batching.
-        
-        Args:
-            class_label: Target class to generate
-            n_samples: Number of final samples needed
-            oversample_factor: Generate n_samples * oversample_factor for filtering
-            max_batch_size: Maximum samples to process at once (prevents OOM)
-        
-        Returns:
-            Generated samples as numpy array
-        """
-        self.denoiser.eval()
-        n_generate = n_samples * oversample_factor
-        
-        # If n_generate is small, process in one batch
-        if n_generate <= max_batch_size:
-            x_t = torch.randn(n_generate, self.n_features, device=self.device)
-            y_cond = torch.full(
-                (n_generate,), class_label, device=self.device, dtype=torch.long
-            )
-            import math
-            curv_val = self.fisher.curvatures.get(class_label, 1.0)
-            all_curvs = list(self.fisher.curvatures.values())
-            log_curvs = [math.log1p(c) for c in all_curvs]
-            log_min = min(log_curvs)
-            log_range = max(log_curvs) - log_min
-            curv_norm = (math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
-            curvature = torch.full(
-                (n_generate,), curv_norm, device=self.device, dtype=torch.float32
-            )
-
-            for t in reversed(range(self.total_timesteps)):
-                x_t = self._p_sample_step(x_t, t, y=y_cond, curvature=curvature)
-
-            return x_t.cpu().numpy()
-        
-        # Process in batches to avoid OOM
-        all_samples = []
-        n_batches = (n_generate + max_batch_size - 1) // max_batch_size
-        
-        for batch_idx in range(n_batches):
-            start_idx = batch_idx * max_batch_size
-            end_idx = min(start_idx + max_batch_size, n_generate)
-            batch_size = end_idx - start_idx
-            
-            x_t = torch.randn(batch_size, self.n_features, device=self.device)
-            y_cond = torch.full(
-                (batch_size,), class_label, device=self.device, dtype=torch.long
-            )
-            curv_val = self.fisher.curvatures.get(class_label, 1.0)
-            curv_max = max(self.fisher.curvatures.values())
-            curv_norm = curv_val / curv_max if curv_max > 0 else 0.0
-            curvature = torch.full(
-                (batch_size,), curv_norm, device=self.device, dtype=torch.float32
-            )
-            
-            for t in reversed(range(self.total_timesteps)):
-                x_t = self._p_sample_step(x_t, t, y=y_cond, curvature=curvature)
-            
-            all_samples.append(x_t.cpu().numpy())
-        
-        return np.vstack(all_samples)
-
     def sample(self, n_per_class=None):
         """Generate synthetic samples in batches for quality and memory efficiency."""
         if self.denoiser is None:
@@ -469,7 +404,12 @@ class MATDiffPipeline:
             class_samples = []
             
             for batch_idx in range(n_batches):
-                batch_size = min(MAX_BATCH, n_needed - len(class_samples))
+                # Calculate how many samples we've generated so far
+                samples_generated = sum(len(s) for s in class_samples)
+                batch_size = min(MAX_BATCH, n_needed - samples_generated)
+                
+                if batch_size <= 0:
+                    break  # Already have enough samples
                 
                 # Initialize noise
                 x_t = torch.randn(batch_size, self.n_features, device=self.device)
@@ -548,6 +488,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
