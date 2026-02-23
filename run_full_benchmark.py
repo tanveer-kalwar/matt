@@ -1072,6 +1072,10 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             
             # Train ALL variants on THIS split
             for variant_name, variant_config in ABLATION_VARIANTS.items():
+                print(f"    [{variant_name}]", end=" ", flush=True)  # ← ADD THIS
+                
+                # Configure variant
+                if variant_name == "IDENTITY":
                 
                 # Configure variant
                 if variant_name == "IDENTITY":
@@ -1143,6 +1147,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 variant_results[variant_name]['F1'].append(f1_avg)
                 variant_results[variant_name]['Acc'].append(acc_avg)
                 variant_results[variant_name]['MCC'].append(mcc_avg)
+                print(f"F1={f1_avg:.4f}")  # ← ADD THIS
         
         # Aggregate results
         print(f"\n  [Dataset Summary: {ds_name}]")
@@ -1241,6 +1246,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
