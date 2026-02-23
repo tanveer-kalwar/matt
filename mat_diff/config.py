@@ -171,13 +171,13 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     else:
         epochs = 300
     
-    # d_hidden: IR-adaptive capacity
+    # d_hidden: IR-adaptive capacity with safety cap
     if n_samples < 5000:
-        d_hidden = d_model * 2  # Conservative for small datasets
+        d_hidden = min(512, d_model * 2)  # Cap to prevent overfitting
     elif ir > 20:
-        d_hidden = d_model * 4  # High capacity for high IR
+        d_hidden = min(1024, d_model * 4)  # High capacity with cap
     else:
-        d_hidden = d_model * 3  # Moderate capacity
+        d_hidden = min(768, d_model * 3)  # Moderate capacity with cap
 
     return {
         "d_model": d_model,
@@ -211,6 +211,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
