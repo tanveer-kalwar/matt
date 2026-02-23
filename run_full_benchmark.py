@@ -1074,10 +1074,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             for variant_name, variant_config in ABLATION_VARIANTS.items():
                 print(f"    [{variant_name}]", end=" ", flush=True)  # ← ADD THIS
                 
-                # Configure variant
-                if variant_name == "IDENTITY":
-                
-                # Configure variant
+               # Configure variant
                 if variant_name == "IDENTITY":
                     X_aug, y_aug = X_tr, y_tr
                     
@@ -1246,6 +1243,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
