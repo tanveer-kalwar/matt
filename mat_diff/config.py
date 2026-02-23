@@ -145,24 +145,39 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         n_phases:   3 (coarse/medium/fine spectral phases)
     """
     # d_model: MINIMAL to prevent overfitting
-    raw_d = max(32, 2 * n_features)
-    d_model = min(64, 2 ** math.ceil(math.log2(raw_d)))
-
-    n_blocks = 2
-
-    # n_heads: each head handles ~32 dims
-    n_heads = max(2, d_model // 32)
-
+    base_d = max(64, 4 * n_features)  # 4x instead of 2x
+    d_model = min(256, 2 ** math.ceil(math.log2(base_d)))
+    
+    # n_blocks: More blocks for high IR
+    if ir > 20:
+        n_blocks = 3
+    else:
+        n_blocks = 2
+    
+    # n_heads: each head ~64 dims (not 32)
+    n_heads = max(2, d_model // 64)
+    
     # batch_size
     batch_size = min(512, max(64, n_samples // 6))
-    # round to nearest power of 2 for GPU efficiency
     batch_size = 2 ** round(math.log2(batch_size))
-
-    # epochs: fixed at 300
-    epochs = 300
-
-    # d_hidden: 2x d_model (standard MLP expansion ratio)
-    d_hidden = d_model * 2
+    
+    # epochs: Scale with IR (DGOT Table X insight)
+    if ir > 50:
+        epochs = 800
+    elif ir > 20:
+        epochs = 600
+    elif ir > 10:
+        epochs = 400
+    else:
+        epochs = 300
+    
+    # d_hidden: IR-adaptive capacity
+    if n_samples < 5000:
+        d_hidden = d_model * 2  # Conservative for small datasets
+    elif ir > 20:
+        d_hidden = d_model * 4  # High capacity for high IR
+    else:
+        d_hidden = d_model * 3  # Moderate capacity
 
     return {
         "d_model": d_model,
@@ -174,7 +189,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "lr": 4e-4,
         "dropout": 0.1,
         "total_timesteps": 1000,
-        "n_phases": 1,
+        "n_phases": 3 if ir > 10 else 1,
         "weight_decay": 1e-5,
         "n_seeds": 10,
     }
@@ -196,6 +211,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
