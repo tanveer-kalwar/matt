@@ -622,7 +622,13 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
 
             # No fixed split - will create per-seed splits below
             print(f"  Total data: {len(X_all)} samples")
-                
+            
+            # CREATE FIXED SPLIT FOR DGOT/GOIO (they need pre-training)
+            from sklearn.model_selection import train_test_split
+            X_tr_fixed, X_te_fixed, y_tr_fixed, y_te_fixed = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+            )
+                    
         except Exception as e:
             print(f"  SKIP: {e}")
             continue
@@ -631,7 +637,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         matdiff_trained = False
         cfg = get_matdiff_config(ds_name)
         matdiff_epochs = matdiff_epochs_override or cfg["epochs"]
-
+    
         # Train External Baselines (DGOT/GOIO) if enabled
         dgot_trained = False
         goio_trained = False
@@ -1243,6 +1249,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
