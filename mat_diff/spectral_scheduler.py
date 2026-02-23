@@ -166,10 +166,11 @@ class SpectralCurriculumScheduler:
         
         if phase == 0:  # Early phase: bias toward high timesteps (coarse)
             bias = int((1.0 - progress) * 0.3 * (t_high - t_low))
-            t = torch.clamp(t + bias, t_low, t_high - 1)
+            t = torch.clamp(t + bias, 0, self.total_timesteps - 1)
         elif phase == self.n_phases - 1:  # Late phase: bias toward low timesteps (fine)
             bias = int(progress * 0.3 * (t_high - t_low))
-            t = torch.clamp(t - bias, t_low, t_high - 1)
+            t = torch.clamp(t - bias, 0, self.total_timesteps - 1)
     
     return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
