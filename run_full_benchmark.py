@@ -646,6 +646,34 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         if "GOIO" in ALL_METHODS:
              goio_trained = setup_and_train_goio(ds_name, X_tr_fixed, y_tr_fixed, device)
 
+        # Train MAT-Diff ONCE on fixed split (like DGOT/GOIO)
+        if "MAT-Diff" in ALL_METHODS:
+            print(f"\n  ┌─ Training MAT-Diff on fixed split")
+            try:
+                matdiff_pipeline = MATDiffPipeline(
+                    device=device,
+                    d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
+                    n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
+                    n_phases=cfg.get("n_phases", 1),
+                    total_timesteps=cfg.get("total_timesteps", 1000),
+                    dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
+                    weight_decay=cfg.get("weight_decay", 1e-5),
+                )
+                matdiff_pipeline.fit(X_tr_fixed, y_tr_fixed, epochs=matdiff_epochs,
+                           batch_size=cfg["batch_size"], verbose=False)
+                
+                X_syn_pool, y_syn_pool = matdiff_pipeline.sample()
+                
+                # Save for reuse
+                os.makedirs(f"results_matdiff/{ds_name}", exist_ok=True)
+                np.save(f"results_matdiff/{ds_name}/synthetic_samples.npy", X_syn_pool)
+                np.save(f"results_matdiff/{ds_name}/synthetic_labels.npy", y_syn_pool)
+                matdiff_trained = True
+                print(f"  └─ MAT-Diff training SUCCESS ✓")
+            except Exception as e:
+                print(f"  └─ MAT-Diff training FAILED: {e} ✗")
+                matdiff_trained = False
+
         # 3. METHOD EVALUATION LOOP
         for method in ALL_METHODS:
             print(f"\n  ┌─ Method: {method}")
@@ -653,38 +681,8 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
             method_results = {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES}
             fidelity = {"MMD": [], "KS": []}
             privacy = {"DCR": [], "MIA": []}
-            
-            # Train MAT-Diff per seed (inside seed loop)
-            if method == "MAT-Diff":
-                # Only train if first iteration with this seed's data
-                try:
-                    print(f"  Training MAT-Diff for seed {seed}...")
-                    matdiff_pipeline = MATDiffPipeline(
-                        device=device,
-                        d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-                        n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-                        n_phases=cfg.get("n_phases", 1),
-                        total_timesteps=cfg.get("total_timesteps", 1000),
-                        dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
-                        weight_decay=cfg.get("weight_decay", 1e-5),
-                    )
-                    # Train on THIS seed's training data
-                    matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
-                               batch_size=cfg["batch_size"], verbose=False)
-                    
-                    X_syn_pool, y_syn_pool = matdiff_pipeline.sample()
-                    
-                    # Save for reuse
-                    os.makedirs(f"results_matdiff/{ds_name}", exist_ok=True)
-                    np.save(f"results_matdiff/{ds_name}/synthetic_samples.npy", X_syn_pool)
-                    np.save(f"results_matdiff/{ds_name}/synthetic_labels.npy", y_syn_pool)
-                    matdiff_trained = True
-                    print(f"  ✓ MAT-Diff trained, generated {len(X_syn_pool)} samples")
-                except Exception as e:
-                    print(f"  ✗ MAT-Diff training FAILED: {e}")
-                    continue
 
-            # 4. CLASSIFIER SEED LOOP (Different 80/20 split per seed)
+            # 4. CLASSIFIER SEED LOOP
             for seed in range(n_seeds):
                 # Create new 80/20 split for THIS seed
                 X_tr, X_te, y_tr, y_te = train_test_split(
@@ -1085,23 +1083,25 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                     X_aug, y_aug = X_tr, y_tr
                     
                 elif variant_name == "w/o Fisher":
-                    d_model, n_blocks, n_phases = 32, 2, 1
-                    d_hidden, lr, epochs = base_d_hidden, 2e-4, FIXED_EPOCHS
+                    # Use config.py-derived d_model (correct size)
+                    d_model = cfg["d_model"]
+                    n_blocks, n_phases = 2, 1
+                    d_hidden, lr, epochs = cfg["d_hidden"], 2e-4, cfg["epochs"]
                     
                 elif variant_name == "w/o Geodesic":
-                    d_model, n_blocks, n_phases = 32, 1, 1
-                    d_hidden, lr, epochs = base_d_hidden, cfg["lr"], FIXED_EPOCHS
+                    d_model = cfg["d_model"]
+                    n_blocks, n_phases = 1, 1  # Remove geodesic
+                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
                     
                 elif variant_name == "w/o Spectral":
-                    d_model, n_blocks, n_phases = 32, 2, 1
-                    d_hidden, lr, epochs = base_d_hidden, cfg["lr"], FIXED_EPOCHS
+                    d_model = cfg["d_model"]
+                    n_blocks, n_phases = 2, 1  # Remove spectral
+                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
                     
                 else:  # MAT-Diff (Ours)
-                    d_model, n_blocks, n_phases = 32, 2, 1
-                    d_hidden = int(base_d_hidden * 2.5)
-                    if ir > 100:
-                        d_hidden = int(d_hidden * 1.5)
-                    lr, epochs = cfg["lr"], FIXED_EPOCHS
+                    d_model = cfg["d_model"]
+                    n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
+                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
                 
                 # Train on THIS seed's training data
                 if variant_name != "IDENTITY":
@@ -1249,6 +1249,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
