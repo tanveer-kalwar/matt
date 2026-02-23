@@ -236,6 +236,8 @@ class MATDiffPipeline:
         max_class_size = max(len(v) for v in class_indices.values())
         balanced_size = max_class_size * self.n_classes
 
+        best_loss = float('inf')
+
         for epoch in range(epochs):
             balanced_idx = []
             for c in range(self.n_classes):
@@ -286,7 +288,7 @@ class MATDiffPipeline:
                 # Adaptive gradient clipping for high-curvature datasets
                 max_norm = 2.0 if max(self.fisher.curvatures.values()) > 500 else 1.0
                 torch.nn.utils.clip_grad_norm_(
-                self.denoiser.parameters(), max_norm=max_norm
+                    self.denoiser.parameters(), max_norm=max_norm
                 )
                 optimizer.step()
 
@@ -296,6 +298,10 @@ class MATDiffPipeline:
             lr_scheduler.step()
             avg_loss = epoch_loss / max(1, n_batches)
             self.train_losses.append(avg_loss)
+            
+            # Track best loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
 
             if verbose and ((epoch + 1) % 50 == 0 or epoch == 0):
                 phase = self.scheduler.get_phase_for_epoch(epoch, epochs)
@@ -331,8 +337,13 @@ class MATDiffPipeline:
         curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
         noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
     
-        # Guided prediction
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        # CRITICAL: Adaptive guidance - higher for minority (high-curvature) classes
+        if curvature is not None:
+            # High curvature (minority) = stronger guidance (up to 3.5x)
+            adaptive_scale = guidance_scale + curvature.view(-1, 1) * 1.5
+            noise_pred = noise_pred_uncond + adaptive_scale * (noise_pred_cond - noise_pred_uncond)
+        else:
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
 
@@ -537,6 +548,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
