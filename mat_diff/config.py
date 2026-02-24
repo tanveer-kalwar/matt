@@ -161,15 +161,9 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batch_size = min(512, max(64, n_samples // 6))
     batch_size = 2 ** round(math.log2(batch_size))
     
-    # epochs: Scale with IR (DGOT Table X insight)
-    if ir > 50:
-        epochs = 800
-    elif ir > 20:
-        epochs = 600
-    elif ir > 10:
-        epochs = 400
-    else:
-        epochs = 300
+    # Use SAME epochs as config.py (no separate logic!)
+    epochs = cfg["epochs"]
+    total_timesteps = cfg["total_timesteps"]
     
     # d_hidden: IR-adaptive capacity with safety cap
     if n_samples < 5000:
@@ -198,12 +192,13 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
 def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     """Get fully-derived config for any dataset. Zero manual tuning."""
     if dataset_name not in DATASET_REGISTRY:
-        # Fallback for unknown datasets: use reasonable defaults
         return derive_hyperparams(n_samples=1000, n_features=10, n_classes=2, ir=10.0)
 
     info = DATASET_REGISTRY[dataset_name]
+    # Use 80% of samples (training size after split)
+    train_samples = int(info["n_samples"] * 0.8)
     cfg = derive_hyperparams(
-        n_samples=info["n_samples"],
+        n_samples=train_samples,
         n_features=info["n_features"],
         n_classes=info.get("n_classes", 2),
         ir=info["ir"],
@@ -211,6 +206,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
