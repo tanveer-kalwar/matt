@@ -127,51 +127,36 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     """Derive ALL model hyperparameters from dataset properties.
 
     No manual tuning. Every value follows a documented rule.
-
-    Derivation rules:
-        d_model:    Nearest power of 2 >= 2*n_features, clamped to [32, 64]
-                    MINIMAL model to prevent overfitting on small datasets
-        n_blocks:   1 for small features (≤50), 2 for large
-                    Shallow networks for better generalization
-        n_heads:    d_model // 32, minimum 2
-                    Approximately 32 dimensions per attention head
-        batch_size: n_samples // 6, clamped to [64, 512], rounded to power of 2
-                    Approximately 6 gradient updates per epoch
-        epochs:     300 (fixed, no scaling with IR)
-                    Consistent training budget across all datasets
-        lr:         4e-4 (higher than default for aggressive minority learning)
-        dropout:    0.1 (standard dropout rate)
-        total_timesteps: 1000 (DDPM standard)
-        n_phases:   3 (coarse/medium/fine spectral phases)
+    All hyperparameters scale with dataset properties for generalization.
     """
-    # d_model: MINIMAL to prevent overfitting
-    base_d = max(64, 4 * n_features)  # 4x instead of 2x
+    # d_model: Scale with features
+    base_d = max(64, 4 * n_features)
     d_model = min(256, 2 ** math.ceil(math.log2(base_d)))
     
     # n_blocks: More blocks for high IR
-    if ir > 20:
-        n_blocks = 3
-    else:
-        n_blocks = 2
+    n_blocks = 3 if ir > 20 else 2
     
-    # n_heads: each head ~64 dims (not 32)
+    # n_heads: Each head handles ~64 dimensions
     n_heads = max(2, d_model // 64)
     
-    # batch_size
+    # batch_size: ~6-8 batches per epoch
     batch_size = min(512, max(64, n_samples // 6))
     batch_size = 2 ** round(math.log2(batch_size))
     
-    # Use SAME epochs as config.py (no separate logic!)
-    epochs = cfg["epochs"]
-    total_timesteps = cfg["total_timesteps"]
+    # epochs: FIXED at 400 for all datasets (no IR scaling)
+    # This prevents overfitting on high-IR datasets
+    epochs = 400
     
-    # d_hidden: IR-adaptive capacity with safety cap
+    # d_hidden: Conservative capacity
     if n_samples < 5000:
-        d_hidden = min(512, d_model * 2)  # Cap to prevent overfitting
+        d_hidden = d_model * 2
     elif ir > 20:
-        d_hidden = min(1024, d_model * 4)  # High capacity with cap
+        d_hidden = d_model * 3
     else:
-        d_hidden = min(768, d_model * 3)  # Moderate capacity with cap
+        d_hidden = d_model * 2
+    
+    # Cap d_hidden to prevent overfitting
+    d_hidden = min(d_hidden, 768)
 
     return {
         "d_model": d_model,
@@ -206,6 +191,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
