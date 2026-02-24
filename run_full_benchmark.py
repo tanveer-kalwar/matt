@@ -591,6 +591,8 @@ def load_goio_samples(dataset_name):
 
 def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=None,
                   include_dgot=False, include_goio=False):
+    """IEEE TKDE Protocol: 10 seeds × 5-fold CV = 50 evaluations per dataset."""
+    
     TRADITIONAL = ["Original", "SMOTE", "Borderline-SMOTE", "SMOTE-Tomek", 
                    "ADASYN", "KMeansSMOTE"]
     GENERATIVE = ["CTGAN"] if SDV_AVAILABLE else []
@@ -603,50 +605,46 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
     ALL_METHODS = TRADITIONAL + GENERATIVE + DIFFUSION + OPTIMAL_TRANSPORT + ["MAT-Diff"]
     
     print(f"\nMethods: {', '.join(ALL_METHODS)}")
+    print(f"Protocol: {n_seeds} seeds × {n_folds}-fold CV = {n_seeds * n_folds} evaluations\n")
+    
     all_rows = []
     
     for ds_name in datasets:
         print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
         
         try:
-            # 1. LOAD DATA & CREATE FIXED SPLIT (Prevent Leakage)
             X_tr_full, y_tr_full, X_te_full, y_te_full = load_dataset(ds_name)
             X_all = np.vstack([X_tr_full, X_te_full])
             y_all = np.hstack([y_tr_full, y_te_full])
             
-            # Validate dataset
             n_classes = len(np.unique(y_all))
             if n_classes < 2:
                 print(f"  SKIP: Dataset has only {n_classes} class")
                 continue
 
-            # No fixed split - will create per-seed splits below
-            print(f"  Total data: {len(X_all)} samples")
-            
-            # CREATE FIXED SPLIT FOR DGOT/GOIO (they need pre-training)
-            from sklearn.model_selection import train_test_split
-            X_tr_fixed, X_te_fixed, y_tr_fixed, y_te_fixed = train_test_split(
-                X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
-            )
+            print(f"  Total: {len(X_all)} samples, {X_all.shape[1]} features")
                     
         except Exception as e:
             print(f"  SKIP: {e}")
             continue
         
-        # 2. TRAIN GENERATIVE MODELS ONCE (On Fixed Train Set)
-        matdiff_trained = False
         cfg = get_matdiff_config(ds_name)
         matdiff_epochs = matdiff_epochs_override or cfg["epochs"]
-    
-        # Train External Baselines (DGOT/GOIO) if enabled
+        
+        # Train DGOT/GOIO once on full 80% train split
+        from sklearn.model_selection import train_test_split
+        X_tr_80, _, y_tr_80, _ = train_test_split(
+            X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+        )
+        
         dgot_trained = False
         goio_trained = False
         if "DGOT" in ALL_METHODS:
-             dgot_trained = setup_and_train_dgot(ds_name, X_tr_fixed, y_tr_fixed, device)
+            dgot_trained = setup_and_train_dgot(ds_name, X_tr_80, y_tr_80, device)
         if "GOIO" in ALL_METHODS:
-             goio_trained = setup_and_train_goio(ds_name, X_tr_fixed, y_tr_fixed, device)
-
-        # 3. INITIALIZE RESULTS STORAGE
+            goio_trained = setup_and_train_goio(ds_name, X_tr_80, y_tr_80, device)
+        
+        # Initialize results storage
         all_method_results = {}
         for method in ALL_METHODS:
             all_method_results[method] = {
@@ -655,123 +653,131 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 'privacy': {"DCR": [], "MIA": []}
             }
         
-        # 4. SEED LOOP (train and evaluate per seed)
+        # DGOT Protocol: 10 seeds × 5-fold CV
+        total_evals = 0
         for seed in range(n_seeds):
             print(f"\n  [Seed {seed+1}/{n_seeds}]")
             
-            # Create THIS seed's 80/20 split
-            from sklearn.model_selection import train_test_split
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
-            )
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
             
-            # 5. METHOD LOOP
-            for method in ALL_METHODS:
-                print(f"    [{method}]", end=" ", flush=True)
+            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_all, y_all)):
+                X_tr = X_all[train_idx]
+                X_te = X_all[test_idx]
+                y_tr = y_all[train_idx]
+                y_te = y_all[test_idx]
                 
-                X_aug, y_aug, X_syn = None, None, None
-                
-                # --- APPLY SAMPLERS ---
-                if method in TRADITIONAL:
-                    out = apply_traditional_resampler(method, X_tr, y_tr, seed)
-                    if out: X_aug, y_aug, X_syn = out
-                
-                elif method in GENERATIVE:
-                    out = apply_generative_resample(X_tr, y_tr, method, seed)
-                    if out: X_aug, y_aug, X_syn = out
-                
-                elif method == "TabDDPM":
-                    out = apply_tabddpm_resample(X_tr, y_tr, seed, device)
-                    if out: X_aug, y_aug, X_syn = out
-                
-                elif method == "MAT-Diff":
-                    try:
-                        matdiff_pipeline = MATDiffPipeline(
-                            device=device,
-                            d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-                            n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-                            n_phases=cfg.get("n_phases", 1),
-                            total_timesteps=cfg.get("total_timesteps", 1000),
-                            dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
-                            weight_decay=cfg.get("weight_decay", 1e-5),
-                        )
-                        matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
-                                   batch_size=cfg["batch_size"], verbose=False)
-                        
-                        X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
-                        
-                        # Balance
-                        cc = Counter(y_tr)
-                        minority_label = min(cc, key=cc.get)
-                        needed = max(cc.values()) - cc[minority_label]
-                        
-                        mask = (y_syn_raw == minority_label)
-                        X_syn_filt = X_syn_raw[mask]
-                        
-                        if len(X_syn_filt) > 0:
-                            take = min(needed, len(X_syn_filt))
-                            X_syn = X_syn_filt[:take]
-                            y_syn_aug = np.full(len(X_syn), minority_label)
+                for method in ALL_METHODS:
+                    X_aug, y_aug, X_syn = None, None, None
+                    
+                    # Traditional methods: train per fold
+                    if method in TRADITIONAL:
+                        out = apply_traditional_resampler(method, X_tr, y_tr, seed)
+                        if out: X_aug, y_aug, X_syn = out
+                    
+                    # Generative: train per fold
+                    elif method in GENERATIVE:
+                        out = apply_generative_resample(X_tr, y_tr, method, seed)
+                        if out: X_aug, y_aug, X_syn = out
+                    
+                    # TabDDPM: train per fold
+                    elif method == "TabDDPM":
+                        out = apply_tabddpm_resample(X_tr, y_tr, seed, device)
+                        if out: X_aug, y_aug, X_syn = out
+                    
+                    # MAT-Diff: train per fold
+                    elif method == "MAT-Diff":
+                        try:
+                            matdiff_pipeline = MATDiffPipeline(
+                                device=device,
+                                d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
+                                n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
+                                n_phases=cfg.get("n_phases", 1),
+                                total_timesteps=cfg.get("total_timesteps", 1000),
+                                dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
+                                weight_decay=cfg.get("weight_decay", 1e-5),
+                            )
+                            matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
+                                       batch_size=cfg["batch_size"], verbose=False)
+                            
+                            X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
+                            
+                            cc = Counter(y_tr)
+                            minority_label = min(cc, key=cc.get)
+                            needed = max(cc.values()) - cc[minority_label]
+                            
+                            mask = (y_syn_raw == minority_label)
+                            X_syn = X_syn_raw[mask][:needed]
+                            y_syn = np.full(len(X_syn), minority_label)
+                            
                             X_aug = np.vstack([X_tr, X_syn])
-                            y_aug = np.hstack([y_tr, y_syn_aug])
-                        else:
+                            y_aug = np.hstack([y_tr, y_syn])
+                        except Exception as e:
+                            print(f"    [MAT-Diff] Fold {fold_idx+1} FAIL: {str(e)[:50]}")
                             X_aug, y_aug = X_tr, y_tr
-                    except Exception as e:
-                        print(f"FAIL", end=" ")
+                    
+                    # DGOT/GOIO: use pre-trained samples
+                    elif method == "DGOT" and dgot_trained:
+                        X_syn_all = load_dgot_samples(ds_name)
+                        if X_syn_all is not None:
+                            cc = Counter(y_tr)
+                            minority_label = min(cc, key=cc.get)
+                            needed = max(cc.values()) - cc[minority_label]
+                            X_syn = X_syn_all[:needed]
+                            y_syn = np.full(len(X_syn), minority_label)
+                            X_aug = np.vstack([X_tr, X_syn])
+                            y_aug = np.hstack([y_tr, y_syn])
+                    
+                    elif method == "GOIO" and goio_trained:
+                        X_syn_all = load_goio_samples(ds_name)
+                        if X_syn_all is not None:
+                            cc = Counter(y_tr)
+                            minority_label = min(cc, key=cc.get)
+                            needed = max(cc.values()) - cc[minority_label]
+                            X_syn = X_syn_all[:needed]
+                            y_syn = np.full(len(X_syn), minority_label)
+                            X_aug = np.vstack([X_tr, X_syn])
+                            y_aug = np.hstack([y_tr, y_syn])
+                    
+                    if X_aug is None:
                         X_aug, y_aug = X_tr, y_tr
+                    
+                    # Evaluate
+                    clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                    for cn in CLF_NAMES:
+                        for m in UTIL_METRICS:
+                            all_method_results[method]['utility'][cn][m].append(
+                                clf_res[cn].get(m, np.nan))
+                    
+                    # Fidelity/Privacy (only first fold of first seed)
+                    if seed == 0 and fold_idx == 0 and method != "Original" and X_syn is not None:
+                        minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
+                                                       if v < max(Counter(y_tr).values())])
+                        X_min = X_tr[minority_mask]
+                        if len(X_min) > 0 and len(X_syn) > 0:
+                            all_method_results[method]['fidelity']["MMD"].append(
+                                compute_mmd(X_min, X_syn))
+                            all_method_results[method]['fidelity']["KS"].append(
+                                compute_ks(X_min, X_syn))
+                            all_method_results[method]['privacy']["DCR"].append(
+                                compute_dcr(X_tr, X_syn))
+                            all_method_results[method]['privacy']["MIA"].append(
+                                compute_mia(X_tr, X_syn, X_te))
                 
-                elif method == "DGOT" and dgot_trained:
-                    X_syn_all = load_dgot_samples(ds_name)
-                    if X_syn_all is not None:
-                        cc = Counter(y_tr)
-                        minority_label = min(cc, key=cc.get)
-                        needed = max(cc.values()) - cc[minority_label]
-                        X_syn = X_syn_all[:min(needed, len(X_syn_all))]
-                        y_syn_aug = np.full(len(X_syn), minority_label)
-                        X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn_aug])
-                
-                elif method == "GOIO" and goio_trained:
-                    X_syn_all = load_goio_samples(ds_name)
-                    if X_syn_all is not None:
-                        cc = Counter(y_tr)
-                        minority_label = min(cc, key=cc.get)
-                        needed = max(cc.values()) - cc[minority_label]
-                        X_syn = X_syn_all[:min(needed, len(X_syn_all))]
-                        y_syn_aug = np.full(len(X_syn), minority_label)
-                        X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn_aug])
-                
-                # Fallback
-                if X_aug is None:
-                    X_aug, y_aug = X_tr, y_tr
-                
-                # EVALUATE
-                clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
-                for cn in CLF_NAMES:
-                    for m in UTIL_METRICS:
-                        all_method_results[method]['utility'][cn][m].append(clf_res[cn].get(m, np.nan))
-                
-                # Fidelity/Privacy (only on first seed)
-                if seed == 0 and method != "Original" and X_syn is not None and len(X_syn) > 0:
-                    minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
-                                                   if v < max(Counter(y_tr).values())])
-                    X_min = X_tr[minority_mask]
-                    if len(X_min) > 0:
-                        all_method_results[method]['fidelity']["MMD"].append(compute_mmd(X_min, X_syn))
-                        all_method_results[method]['fidelity']["KS"].append(compute_ks(X_min, X_syn))
-                    all_method_results[method]['privacy']["DCR"].append(compute_dcr(X_tr, X_syn))
-                    all_method_results[method]['privacy']["MIA"].append(compute_mia(X_tr, X_syn, X_te))
-                
-                # Print F1 for this seed
-                f1_val = np.mean([clf_res[cn]["F1"] for cn in CLF_NAMES])
-                print(f"F1={f1_val:.4f}")
+                total_evals += 1
+                if fold_idx == 0:
+                    # Print F1 after first fold
+                    for method in ALL_METHODS:
+                        f1_vals = [all_method_results[method]['utility'][cn]["F1"][-1] 
+                                  for cn in CLF_NAMES]
+                        print(f"    [{method}] F1={np.mean(f1_vals):.4f}", end=" ")
+                    print()
         
-        # 6. AGGREGATE AND STORE RESULTS
+        # Aggregate results
+        print(f"\n  [Summary - {total_evals} evaluations]")
         for method in ALL_METHODS:
             method_results = all_method_results[method]
             
-            # Utility metrics
+            # Store utility
             for cn in CLF_NAMES:
                 for m in UTIL_METRICS:
                     vals = [v for v in method_results['utility'][cn][m] if not np.isnan(v)]
@@ -782,42 +788,42 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                             "Std": float(np.std(vals)), "N": len(vals),
                         })
             
-            # Fidelity metrics
+            # Store fidelity/privacy
             for m in ["MMD", "KS"]:
                 vals = [v for v in method_results['fidelity'][m] if not np.isnan(v)]
                 if vals:
                     all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
-                        "Metric": m, "Mean": float(np.mean(vals)), "Std": float(np.std(vals)), "N": len(vals)})
+                        "Metric": m, "Mean": float(np.mean(vals)), 
+                        "Std": float(np.std(vals)), "N": len(vals)})
             
-            # Privacy metrics
             for m in ["DCR", "MIA"]:
                 vals = [v for v in method_results['privacy'][m] if not np.isnan(v)]
                 if vals:
                     all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
-                        "Metric": m, "Mean": float(np.mean(vals)), "Std": float(np.std(vals)), "N": len(vals)})
+                        "Metric": m, "Mean": float(np.mean(vals)), 
+                        "Std": float(np.std(vals)), "N": len(vals)})
             
             # Print summary
             f1_vals = []
             for cn in CLF_NAMES:
-                f1_vals.extend([v for v in method_results['utility'][cn]["F1"] if not np.isnan(v)])
+                f1_vals.extend([v for v in method_results['utility'][cn]["F1"] 
+                               if not np.isnan(v)])
             if f1_vals:
-                print(f"  └─ {method:<20s} Avg F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
+                print(f"    {method:<20s} F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
 
-    # [Final Saving]
+    # Save results
     df = pd.DataFrame(all_rows)
     out_path = os.path.abspath("benchmark_results.csv")
     df.to_csv(out_path, index=False)
     print(f"\n✓ Saved: {out_path}")
-
-    # [Full Table Printing Logic]
+    
+    # Print summary table (keeping your existing summary code)
     if len(all_rows) > 0:
         print("\n" + "=" * 120)
-        print("FULL BENCHMARK SUMMARY TABLE (Average across all classifiers, seeds, folds)")
+        print("BENCHMARK SUMMARY")
         print("=" * 120)
-
+        
         methods = df["Method"].unique()
-        datasets_done = df["Dataset"].unique()
-
         summary_rows = []
         for method in methods:
             mdf = df[df["Method"] == method]
@@ -830,197 +836,34 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 else:
                     row[metric] = "--"
             summary_rows.append(row)
-
-        summary_df = pd.DataFrame(summary_rows)
-        summary_df = summary_df.set_index("Method")
+        
+        summary_df = pd.DataFrame(summary_rows).set_index("Method")
         print(summary_df.to_string())
         print("=" * 120)
-
-        # Save summary
-        summary_path = os.path.join(os.path.dirname(out_path), "benchmark_summary.csv")
-        summary_df.to_csv(summary_path)
-        print(f"Summary saved to: {summary_path}")
-
-        # ============================================================
-        # STATISTICAL SIGNIFICANCE TESTS
-        # ============================================================
         
-        if "MAT-Diff" in methods and len(datasets_done) >= 5:
-            from scipy import stats
-            
-            print("\n" + "=" * 120)
-            print("STATISTICAL SIGNIFICANCE TESTS")
-            print("=" * 120)
-            
-            # Step 1: Friedman Test
-            print("\n[1] FRIEDMAN TEST (Global Comparison)")
-            print("-" * 80)
-            
-            friedman_data = {}
-            for method in methods:
-                friedman_data[method] = []
-                for dataset in datasets_done:
-                    f1_vals = df[(df["Dataset"] == dataset) & 
-                                (df["Method"] == method) & 
-                                (df["Metric"] == "F1")]["Mean"].values
-                    if len(f1_vals) > 0:
-                        friedman_data[method].append(f1_vals[0])
-            
-            complete_methods = [m for m in methods if len(friedman_data[m]) == len(datasets_done)]
-            
-            if len(complete_methods) >= 3 and len(datasets_done) >= 5:
-                friedman_matrix = np.array([friedman_data[m] for m in complete_methods]).T
-                
-                try:
-                    stat, p_value = stats.friedmanchisquare(*friedman_matrix.T)
-                    print(f"  Friedman χ²: {stat:.4f}")
-                    print(f"  p-value: {p_value:.6f}")
-                    
-                    if p_value < 0.05:
-                        print(f"  Result: REJECT null hypothesis (p < 0.05) ✓")
-                    else:
-                        print(f"  Result: ACCEPT null hypothesis (p ≥ 0.05)")
-                    
-                    # Mean Ranks
-                    print(f"\n  Mean Ranks (lower is better):")
-                    ranks = stats.rankdata(-friedman_matrix, axis=1)
-                    mean_ranks = ranks.mean(axis=0)
-                    
-                    rank_table = []
-                    for i, method in enumerate(complete_methods):
-                        rank_table.append({
-                            "Method": method,
-                            "Mean Rank": f"{mean_ranks[i]:.2f}",
-                            "Avg F1": f"{np.mean(friedman_data[method]):.4f}"
-                        })
-                    
-                    rank_df = pd.DataFrame(rank_table).sort_values("Mean Rank")
-                    print(rank_df.to_string(index=False))
-                    
-                except Exception as e:
-                    print(f"  Friedman test failed: {e}")
-            else:
-                print(f"  Skipped: Need ≥3 methods and ≥5 datasets.")
-            
-            # Step 2: Wilcoxon Signed-Rank Tests
-            print("\n[2] WILCOXON SIGNED-RANK TEST (MAT-Diff vs Each Baseline)")
-            print("-" * 80)
-            
-            matdiff_f1 = []
-            for dataset in datasets_done:
-                vals = df[(df["Dataset"] == dataset) & 
-                         (df["Method"] == "MAT-Diff") & 
-                         (df["Metric"] == "F1")]["Mean"].values
-                if len(vals) > 0:
-                    matdiff_f1.append(vals[0])
-            
-            wilcoxon_results = []
-            for baseline in methods:
-                if baseline == "MAT-Diff": continue
-                
-                baseline_f1 = []
-                for dataset in datasets_done:
-                    vals = df[(df["Dataset"] == dataset) & 
-                             (df["Method"] == baseline) & 
-                             (df["Metric"] == "F1")]["Mean"].values
-                    if len(vals) > 0:
-                        baseline_f1.append(vals[0])
-                
-                min_len = min(len(matdiff_f1), len(baseline_f1))
-                if min_len >= 5:
-                    try:
-                        stat, p_value = stats.wilcoxon(
-                            matdiff_f1[:min_len], 
-                            baseline_f1[:min_len],
-                            alternative='greater'
-                        )
-                        mat_mean = np.mean(matdiff_f1[:min_len])
-                        base_mean = np.mean(baseline_f1[:min_len])
-                        diff = mat_mean - base_mean
-                        sig_marker = "✓ SIGNIFICANT" if p_value < 0.05 else "✗ Not significant"
-                        
-                        wilcoxon_results.append({
-                            "Baseline": baseline,
-                            "MAT-Diff F1": f"{mat_mean:.4f}",
-                            "Baseline F1": f"{base_mean:.4f}",
-                            "Difference": f"{diff:+.4f}",
-                            "p-value": f"{p_value:.4f}",
-                            "Result": sig_marker
-                        })
-                    except Exception as e:
-                        pass
-            
-            if wilcoxon_results:
-                wilcoxon_df = pd.DataFrame(wilcoxon_results)
-                print(wilcoxon_df.to_string(index=False))
-            else:
-                print("  No valid pairwise comparisons (need ≥5 datasets)")
-            
-            # Step 3: Win/Tie/Loss Analysis
-            print("\n[3] WIN/TIE/LOSS COUNT (MAT-Diff vs Each Baseline)")
-            print("-" * 80)
-            
-            wtl_results = []
-            for baseline in methods:
-                if baseline == "MAT-Diff": continue
-                
-                wins, ties, losses = 0, 0, 0
-                for dataset in datasets_done:
-                    mat_vals = df[(df["Dataset"] == dataset) & 
-                                 (df["Method"] == "MAT-Diff") & 
-                                 (df["Metric"] == "F1")]["Mean"].values
-                    base_vals = df[(df["Dataset"] == dataset) & 
-                                  (df["Method"] == baseline) & 
-                                  (df["Metric"] == "F1")]["Mean"].values
-                    
-                    if len(mat_vals) > 0 and len(base_vals) > 0:
-                        diff = mat_vals[0] - base_vals[0]
-                        if diff > 0.001: wins += 1
-                        elif diff < -0.001: losses += 1
-                        else: ties += 1
-                
-                total = wins + ties + losses
-                if total > 0:
-                    win_rate = (wins / total) * 100
-                    wtl_results.append({
-                        "Baseline": baseline,
-                        "W/T/L": f"{wins}/{ties}/{losses}",
-                        "Win Rate": f"{win_rate:.1f}%"
-                    })
-            
-            if wtl_results:
-                wtl_df = pd.DataFrame(wtl_results)
-                print(wtl_df.to_string(index=False))
-            
-            print("=" * 120)
+        summary_df.to_csv("benchmark_summary.csv")
+    
     return df
                       
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
-    """
-    DGOT-EXACT ablation protocol with ZERO data leakage.
-    
-    Critical: Train and evaluate on THE SAME 80/20 split per seed.
-    """
-    from mat_diff.manifold_diffusion import MATDiffPipeline
-    from sklearn.model_selection import train_test_split
+    """IEEE TKDE Protocol: 10 seeds × 5-fold CV = 50 evaluations per variant."""
     
     print("\n" + "=" * 120)
-    print("ABLATION STUDY: DGOT Protocol (10 Seeds, 80/20 Split)")
+    print("ABLATION STUDY: IEEE TKDE Protocol (10 Seeds × 5-Fold CV)")
     print("=" * 120)
     
     ABLATION_VARIANTS = {
-        "IDENTITY": {"description": "No oversampling"},
-        "w/o Fisher": {"description": "Remove Fisher (lr=2e-4)"},
-        "w/o Geodesic": {"description": "Remove Geodesic (n_blocks=1)"},
-        "w/o Spectral": {"description": "Remove Spectral (n_phases=1)"},
-        "MAT-Diff (Ours)": {"description": "Full model"},
+        "IDENTITY": "No oversampling",
+        "w/o Fisher": "Remove Fisher weighting (lr=2e-4)",
+        "w/o Geodesic": "Remove Geodesic Attention (n_blocks=1)",
+        "w/o Spectral": "Remove Spectral Curriculum (n_phases=1)",
+        "MAT-Diff (Ours)": "Full model with all components",
     }
     
     all_results = []
-    SKIP_DATASETS = {'abalone_19', 'Dry_Beans'}
     
     for ds_name in datasets:
-        if ds_name in SKIP_DATASETS:
+        if ds_name in {'abalone_19', 'Dry_Beans'}:
             continue
 
         print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
@@ -1030,128 +873,112 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             X_all = np.vstack([X_tr_full, X_te_full])
             y_all = np.hstack([y_tr_full, y_te_full])
             
-            n_classes = len(np.unique(y_all))
-            if n_classes < 2:
+            if len(np.unique(y_all)) < 2:
                 continue
-            print(f"  Full dataset: {len(X_all)} samples")
+            print(f"  Total: {len(X_all)} samples")
 
         except Exception as e:
             print(f"  SKIP: {e}")
             continue
 
         cfg = get_matdiff_config(ds_name)
-        ir = cfg.get("ir", 10.0)
         
-        # IR-adaptive hyperparameters
-        if ir > 50:
-            total_timesteps, FIXED_EPOCHS = 2000, 600
-        elif ir > 20:
-            total_timesteps, FIXED_EPOCHS = 1500, 500
-        elif ir > 10:
-            total_timesteps, FIXED_EPOCHS = 1000, 400
-        else:
-            total_timesteps, FIXED_EPOCHS = 500, 300
+        # Use SAME epochs as benchmark (from config.py)
+        FIXED_EPOCHS = cfg["epochs"]
         
-        n_samples = len(X_tr_full)
-        if n_samples < 5000:
-            base_d_hidden = 64
-        elif n_samples < 20000:
-            base_d_hidden = 96
-        else:
-            base_d_hidden = 128
-
-        # ========================================
-        # CRITICAL: Train and evaluate on SAME split per seed
-        # ========================================
         variant_results = {var: {'F1': [], 'Acc': [], 'MCC': []} for var in ABLATION_VARIANTS}
         
+        # 10 seeds × 5 folds = 50 evaluations
         for seed in range(n_seeds):
-            # Create THIS seed's 80/20 split
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
-            )
-            
             print(f"\n  [Seed {seed+1}/{n_seeds}]")
             
-            # Train ALL variants on THIS split
-            for variant_name, variant_config in ABLATION_VARIANTS.items():
-                print(f"    [{variant_name}]", end=" ", flush=True)  # ← ADD THIS
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            
+            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_all, y_all)):
+                X_tr = X_all[train_idx]
+                X_te = X_all[test_idx]
+                y_tr = y_all[train_idx]
+                y_te = y_all[test_idx]
                 
-               # Configure variant
-                if variant_name == "IDENTITY":
-                    X_aug, y_aug = X_tr, y_tr
-                    
-                elif variant_name == "w/o Fisher":
-                    d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                    n_blocks, n_phases = 2, 1
-                    lr, epochs = 2e-4, cfg["epochs"]  # ← Only change: lr=2e-4
-                    
-                elif variant_name == "w/o Geodesic":
-                    d_model = cfg["d_model"]
-                    n_blocks, n_phases = 1, 1  # Remove geodesic
-                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
-                    
-                elif variant_name == "w/o Spectral":
-                    d_model = cfg["d_model"]
-                    n_blocks, n_phases = 2, 1  # Remove spectral
-                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
-                    
-                else:  # MAT-Diff (Ours)
-                    d_model = cfg["d_model"]
-                    n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
-                    d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], cfg["epochs"]
-                
-                # Train on THIS seed's training data
-                if variant_name != "IDENTITY":
-                    try:
-                        n_heads = max(2, d_model // 32)
-                        pipeline = MATDiffPipeline(
-                            device=device, d_model=d_model, d_hidden=d_hidden,
-                            n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
-                            total_timesteps=total_timesteps, dropout=0.1, lr=lr,
-                        )
-                        pipeline.fit(X_tr, y_tr, epochs=epochs,
-                                    batch_size=cfg["batch_size"], verbose=False)
-                        
-                        # Generate samples
-                        X_syn_raw, y_syn_raw = pipeline.sample()
-                        
-                        # Balance
-                        cc = Counter(y_tr)
-                        minority_label = min(cc, key=cc.get)
-                        needed = max(cc.values()) - cc[minority_label]
-                        
-                        mask = (y_syn_raw == minority_label)
-                        X_syn_filt = X_syn_raw[mask]
-                        
-                        if len(X_syn_filt) > 0:
-                            take = min(needed, len(X_syn_filt))
-                            X_syn_final = X_syn_filt[:take]
-                            y_syn_final = np.full(len(X_syn_final), minority_label)
-                            X_aug = np.vstack([X_tr, X_syn_final])
-                            y_aug = np.hstack([y_tr, y_syn_final])
-                        else:
-                            X_aug, y_aug = X_tr, y_tr
-                            
-                    except Exception as e:
-                        print(f"      {variant_name} FAILED: {e}")
+                for variant_name in ABLATION_VARIANTS:
+                    # Configure variant
+                    if variant_name == "IDENTITY":
                         X_aug, y_aug = X_tr, y_tr
+                        
+                    elif variant_name == "w/o Fisher":
+                        d_model = cfg["d_model"]
+                        n_blocks, n_phases = 2, 1
+                        d_hidden, lr, epochs = cfg["d_hidden"], 2e-4, FIXED_EPOCHS
+                        n_heads = cfg["n_heads"]
+                        total_timesteps = cfg["total_timesteps"]
+                        
+                    elif variant_name == "w/o Geodesic":
+                        d_model = cfg["d_model"]
+                        n_blocks, n_phases = 1, 1
+                        d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], FIXED_EPOCHS
+                        n_heads = cfg["n_heads"]
+                        total_timesteps = cfg["total_timesteps"]
+                        
+                    elif variant_name == "w/o Spectral":
+                        d_model = cfg["d_model"]
+                        n_blocks, n_phases = 2, 1
+                        d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], FIXED_EPOCHS
+                        n_heads = cfg["n_heads"]
+                        total_timesteps = cfg["total_timesteps"]
+                        
+                    else:  # MAT-Diff (Ours)
+                        d_model = cfg["d_model"]
+                        n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
+                        d_hidden, lr, epochs = cfg["d_hidden"], cfg["lr"], FIXED_EPOCHS
+                        n_heads = cfg["n_heads"]
+                        total_timesteps = cfg["total_timesteps"]
+                    
+                    # Train variant
+                    if variant_name != "IDENTITY":
+                        try:
+                            pipeline = MATDiffPipeline(
+                                device=device, d_model=d_model, d_hidden=d_hidden,
+                                n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
+                                total_timesteps=total_timesteps, dropout=0.1, lr=lr,
+                            )
+                            pipeline.fit(X_tr, y_tr, epochs=epochs,
+                                        batch_size=cfg["batch_size"], verbose=False)
+                            
+                            X_syn_raw, y_syn_raw = pipeline.sample()
+                            
+                            cc = Counter(y_tr)
+                            minority_label = min(cc, key=cc.get)
+                            needed = max(cc.values()) - cc[minority_label]
+                            
+                            mask = (y_syn_raw == minority_label)
+                            X_syn = X_syn_raw[mask][:needed]
+                            y_syn = np.full(len(X_syn), minority_label)
+                            
+                            X_aug = np.vstack([X_tr, X_syn])
+                            y_aug = np.hstack([y_tr, y_syn])
+                        except Exception as e:
+                            X_aug, y_aug = X_tr, y_tr
+                    
+                    # Evaluate
+                    clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                    
+                    f1_avg = np.mean([clf_results[cn]["F1"] for cn in CLF_NAMES])
+                    acc_avg = np.mean([clf_results[cn]["Acc"] for cn in CLF_NAMES])
+                    mcc_avg = np.mean([clf_results[cn]["MCC"] for cn in CLF_NAMES])
+                    
+                    variant_results[variant_name]['F1'].append(f1_avg)
+                    variant_results[variant_name]['Acc'].append(acc_avg)
+                    variant_results[variant_name]['MCC'].append(mcc_avg)
                 
-                # Evaluate with ALL 5 classifiers
-                clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
-                
-                # Average across classifiers
-                f1_avg = np.mean([clf_results[cn]["F1"] for cn in ["XGB", "DTC", "Logit", "RFC", "KNN"]])
-                acc_avg = np.mean([clf_results[cn]["Acc"] for cn in ["XGB", "DTC", "Logit", "RFC", "KNN"]])
-                mcc_avg = np.mean([clf_results[cn]["MCC"] for cn in ["XGB", "DTC", "Logit", "RFC", "KNN"]])
-                
-                variant_results[variant_name]['F1'].append(f1_avg)
-                variant_results[variant_name]['Acc'].append(acc_avg)
-                variant_results[variant_name]['MCC'].append(mcc_avg)
-                print(f"F1={f1_avg:.4f}")  # ← ADD THIS
+                # Print progress after first fold
+                if fold_idx == 0:
+                    print(f"    Fold 1 F1: ", end="")
+                    for var in ABLATION_VARIANTS:
+                        print(f"{var[:10]:>10s}={variant_results[var]['F1'][-1]:.3f} ", end="")
+                    print()
         
         # Aggregate results
-        print(f"\n  [Dataset Summary: {ds_name}]")
+        print(f"\n  [Dataset Summary]")
         for variant_name in ABLATION_VARIANTS:
             f1_mean = np.mean(variant_results[variant_name]['F1'])
             f1_std = np.std(variant_results[variant_name]['F1'])
@@ -1166,7 +993,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 "Acc_Mean": acc_mean, "MCC_Mean": mcc_mean
             })
     
-    # Save
+    # Save and display
     if all_results:
         df = pd.DataFrame(all_results)
         df.to_csv("ablation_results.csv", index=False)
@@ -1247,6 +1074,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
