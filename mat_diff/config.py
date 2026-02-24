@@ -181,7 +181,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
 
     info = DATASET_REGISTRY[dataset_name]
     # Use 80% of samples (training size after split)
-    train_samples = int(info["n_samples"] * 0.8)
+    train_samples = info["n_samples"]
     cfg = derive_hyperparams(
         n_samples=train_samples,
         n_features=info["n_features"],
@@ -191,6 +191,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
