@@ -646,44 +646,16 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         if "GOIO" in ALL_METHODS:
              goio_trained = setup_and_train_goio(ds_name, X_tr_fixed, y_tr_fixed, device)
 
-        # Train MAT-Diff for THIS seed
-        if method == "MAT-Diff":
-            try:
-                matdiff_pipeline = MATDiffPipeline(
-                    device=device,
-                    d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-                    n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-                    n_phases=cfg.get("n_phases", 1),
-                    total_timesteps=cfg.get("total_timesteps", 1000),
-                    dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
-                    weight_decay=cfg.get("weight_decay", 1e-5),
-                )
-                matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
-           batch_size=cfg["batch_size"], verbose=False)
-                
-                X_syn, y_syn = matdiff_pipeline.sample()
-                
-                # Balance
-                cc = Counter(y_tr)
-                minority_label = min(cc, key=cc.get)
-                needed = max(cc.values()) - cc[minority_label]
-                
-                mask = (y_syn == minority_label)
-                X_syn_filt = X_syn[mask]
-                
-                if len(X_syn_filt) > 0:
-                    X_syn = X_syn_filt[:needed]
-                    y_syn = np.full(len(X_syn), minority_label)
-                    X_aug = np.vstack([X_tr, X_syn])
-                    y_aug = np.hstack([y_tr, y_syn])
-                else:
-                    X_aug, y_aug = X_tr, y_tr
-            except Exception as e:
-                print(f"FAIL: {e}")
-                X_aug, y_aug = X_tr, y_tr
-
-        # 3. METHOD EVALUATION LOOP
-        # 3. SEED LOOP (outer loop)
+        # 3. INITIALIZE RESULTS STORAGE
+        all_method_results = {}
+        for method in ALL_METHODS:
+            all_method_results[method] = {
+                'utility': {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES},
+                'fidelity': {"MMD": [], "KS": []},
+                'privacy': {"DCR": [], "MIA": []}
+            }
+        
+        # 4. SEED LOOP (train and evaluate per seed)
         for seed in range(n_seeds):
             print(f"\n  [Seed {seed+1}/{n_seeds}]")
             
@@ -693,111 +665,116 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
             )
             
-            # 4. METHOD LOOP (inner loop)
+            # 5. METHOD LOOP
             for method in ALL_METHODS:
                 print(f"    [{method}]", end=" ", flush=True)
-                
-                if method not in method_results:
-                    method_results[method] = {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES}
-            fidelity = {"MMD": [], "KS": []}
-            privacy = {"DCR": [], "MIA": []}
-
-            # 4. CLASSIFIER SEED LOOP
-            for seed in range(n_seeds):
-                # Create new 80/20 split for THIS seed
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
-                    )
                 
                 X_aug, y_aug, X_syn = None, None, None
                 
                 # --- APPLY SAMPLERS ---
                 if method in TRADITIONAL:
-                    # Traditional methods are fast, can fit inside loop
                     out = apply_traditional_resampler(method, X_tr, y_tr, seed)
                     if out: X_aug, y_aug, X_syn = out
                 
-                elif method in GENERATIVE: # CTGAN/TVAE
+                elif method in GENERATIVE:
                     out = apply_generative_resample(X_tr, y_tr, method, seed)
                     if out: X_aug, y_aug, X_syn = out
                 
                 elif method == "TabDDPM":
                     out = apply_tabddpm_resample(X_tr, y_tr, seed, device)
                     if out: X_aug, y_aug, X_syn = out
-
+                
                 elif method == "MAT-Diff":
-                     if not matdiff_trained: continue
-                     try:
-                        X_syn_all = np.load(f"results_matdiff/{ds_name}/synthetic_samples.npy")
-                        y_syn_all = np.load(f"results_matdiff/{ds_name}/synthetic_labels.npy")
+                    try:
+                        matdiff_pipeline = MATDiffPipeline(
+                            device=device,
+                            d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
+                            n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
+                            n_phases=cfg.get("n_phases", 1),
+                            total_timesteps=cfg.get("total_timesteps", 1000),
+                            dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
+                            weight_decay=cfg.get("weight_decay", 1e-5),
+                        )
+                        matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
+                                   batch_size=cfg["batch_size"], verbose=False)
                         
+                        X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
+                        
+                        # Balance
                         cc = Counter(y_tr)
                         minority_label = min(cc, key=cc.get)
                         needed = max(cc.values()) - cc[minority_label]
                         
-                        # Filter correct class
-                        mask = (y_syn_all == minority_label)
-                        X_syn_filt = X_syn_all[mask]
+                        mask = (y_syn_raw == minority_label)
+                        X_syn_filt = X_syn_raw[mask]
                         
                         if len(X_syn_filt) > 0:
                             take = min(needed, len(X_syn_filt))
                             X_syn = X_syn_filt[:take]
                             y_syn_aug = np.full(len(X_syn), minority_label)
-                            
                             X_aug = np.vstack([X_tr, X_syn])
                             y_aug = np.hstack([y_tr, y_syn_aug])
                         else:
                             X_aug, y_aug = X_tr, y_tr
-                     except:
+                    except Exception as e:
+                        print(f"FAIL", end=" ")
                         X_aug, y_aug = X_tr, y_tr
-
+                
                 elif method == "DGOT" and dgot_trained:
-                     X_syn_all = load_dgot_samples(ds_name)
-                     if X_syn_all is not None:
-                         cc = Counter(y_tr)
-                         minority_label = min(cc, key=cc.get)
-                         needed = max(cc.values()) - cc[minority_label]
-                         X_syn = X_syn_all[:min(needed, len(X_syn_all))]
-                         y_syn_aug = np.full(len(X_syn), minority_label)
-                         X_aug = np.vstack([X_tr, X_syn])
-                         y_aug = np.hstack([y_tr, y_syn_aug])
-
+                    X_syn_all = load_dgot_samples(ds_name)
+                    if X_syn_all is not None:
+                        cc = Counter(y_tr)
+                        minority_label = min(cc, key=cc.get)
+                        needed = max(cc.values()) - cc[minority_label]
+                        X_syn = X_syn_all[:min(needed, len(X_syn_all))]
+                        y_syn_aug = np.full(len(X_syn), minority_label)
+                        X_aug = np.vstack([X_tr, X_syn])
+                        y_aug = np.hstack([y_tr, y_syn_aug])
+                
                 elif method == "GOIO" and goio_trained:
-                     X_syn_all = load_goio_samples(ds_name)
-                     if X_syn_all is not None:
-                         cc = Counter(y_tr)
-                         minority_label = min(cc, key=cc.get)
-                         needed = max(cc.values()) - cc[minority_label]
-                         X_syn = X_syn_all[:min(needed, len(X_syn_all))]
-                         y_syn_aug = np.full(len(X_syn), minority_label)
-                         X_aug = np.vstack([X_tr, X_syn])
-                         y_aug = np.hstack([y_tr, y_syn_aug])
-
-                # Fallback for Original/Identity or failure
-                if X_aug is None: 
+                    X_syn_all = load_goio_samples(ds_name)
+                    if X_syn_all is not None:
+                        cc = Counter(y_tr)
+                        minority_label = min(cc, key=cc.get)
+                        needed = max(cc.values()) - cc[minority_label]
+                        X_syn = X_syn_all[:min(needed, len(X_syn_all))]
+                        y_syn_aug = np.full(len(X_syn), minority_label)
+                        X_aug = np.vstack([X_tr, X_syn])
+                        y_aug = np.hstack([y_tr, y_syn_aug])
+                
+                # Fallback
+                if X_aug is None:
                     X_aug, y_aug = X_tr, y_tr
-
-                # 5. EVALUATE (Loop over classifiers)
+                
+                # EVALUATE
                 clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
                 for cn in CLF_NAMES:
                     for m in UTIL_METRICS:
-                        method_results[cn][m].append(clf_res[cn].get(m, np.nan))
+                        all_method_results[method]['utility'][cn][m].append(clf_res[cn].get(m, np.nan))
                 
-                # Metrics (MMD, DCR, etc.) - Only compute once per method (e.g. on first seed)
+                # Fidelity/Privacy (only on first seed)
                 if seed == 0 and method != "Original" and X_syn is not None and len(X_syn) > 0:
-                     minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
-                                                       if v < max(Counter(y_tr).values())])
-                     X_min = X_tr[minority_mask]
-                     if len(X_min) > 0:
-                        fidelity["MMD"].append(compute_mmd(X_min, X_syn))
-                        fidelity["KS"].append(compute_ks(X_min, X_syn))
-                     privacy["DCR"].append(compute_dcr(X_tr, X_syn))
-                     privacy["MIA"].append(compute_mia(X_tr, X_syn, X_te))
+                    minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
+                                                   if v < max(Counter(y_tr).values())])
+                    X_min = X_tr[minority_mask]
+                    if len(X_min) > 0:
+                        all_method_results[method]['fidelity']["MMD"].append(compute_mmd(X_min, X_syn))
+                        all_method_results[method]['fidelity']["KS"].append(compute_ks(X_min, X_syn))
+                    all_method_results[method]['privacy']["DCR"].append(compute_dcr(X_tr, X_syn))
+                    all_method_results[method]['privacy']["MIA"].append(compute_mia(X_tr, X_syn, X_te))
+                
+                # Print F1 for this seed
+                f1_val = np.mean([clf_res[cn]["F1"] for cn in CLF_NAMES])
+                print(f"F1={f1_val:.4f}")
+        
+        # 6. AGGREGATE AND STORE RESULTS
+        for method in ALL_METHODS:
+            method_results = all_method_results[method]
             
-            # [Store Results Logic]
+            # Utility metrics
             for cn in CLF_NAMES:
                 for m in UTIL_METRICS:
-                    vals = [v for v in method_results[cn][m] if not np.isnan(v)]
+                    vals = [v for v in method_results['utility'][cn][m] if not np.isnan(v)]
                     if vals:
                         all_rows.append({
                             "Dataset": ds_name, "Method": method, "Classifier": cn,
@@ -805,22 +782,24 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                             "Std": float(np.std(vals)), "N": len(vals),
                         })
             
+            # Fidelity metrics
             for m in ["MMD", "KS"]:
-                vals = [v for v in fidelity[m] if not np.isnan(v)]
+                vals = [v for v in method_results['fidelity'][m] if not np.isnan(v)]
                 if vals:
                     all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
                         "Metric": m, "Mean": float(np.mean(vals)), "Std": float(np.std(vals)), "N": len(vals)})
             
+            # Privacy metrics
             for m in ["DCR", "MIA"]:
-                vals = [v for v in privacy[m] if not np.isnan(v)]
+                vals = [v for v in method_results['privacy'][m] if not np.isnan(v)]
                 if vals:
                     all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
                         "Metric": m, "Mean": float(np.mean(vals)), "Std": float(np.std(vals)), "N": len(vals)})
             
-            # Print intermediate F1
+            # Print summary
             f1_vals = []
             for cn in CLF_NAMES:
-                f1_vals.extend([v for v in method_results[cn]["F1"] if not np.isnan(v)])
+                f1_vals.extend([v for v in method_results['utility'][cn]["F1"] if not np.isnan(v)])
             if f1_vals:
                 print(f"  └─ {method:<20s} Avg F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
 
@@ -1269,6 +1248,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
