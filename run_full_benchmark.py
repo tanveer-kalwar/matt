@@ -646,9 +646,8 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         if "GOIO" in ALL_METHODS:
              goio_trained = setup_and_train_goio(ds_name, X_tr_fixed, y_tr_fixed, device)
 
-        # Train MAT-Diff ONCE on fixed split (like DGOT/GOIO)
-        if "MAT-Diff" in ALL_METHODS:
-            print(f"\n  ┌─ Training MAT-Diff on fixed split")
+        # Train MAT-Diff for THIS seed
+        if method == "MAT-Diff":
             try:
                 matdiff_pipeline = MATDiffPipeline(
                     device=device,
@@ -659,26 +658,47 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
                     weight_decay=cfg.get("weight_decay", 1e-5),
                 )
-                matdiff_pipeline.fit(X_tr_fixed, y_tr_fixed, epochs=matdiff_epochs,
-                           batch_size=cfg["batch_size"], verbose=False)
+                matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
+           batch_size=cfg["batch_size"], verbose=False)
                 
-                X_syn_pool, y_syn_pool = matdiff_pipeline.sample()
+                X_syn, y_syn = matdiff_pipeline.sample()
                 
-                # Save for reuse
-                os.makedirs(f"results_matdiff/{ds_name}", exist_ok=True)
-                np.save(f"results_matdiff/{ds_name}/synthetic_samples.npy", X_syn_pool)
-                np.save(f"results_matdiff/{ds_name}/synthetic_labels.npy", y_syn_pool)
-                matdiff_trained = True
-                print(f"  └─ MAT-Diff training SUCCESS ✓")
+                # Balance
+                cc = Counter(y_tr)
+                minority_label = min(cc, key=cc.get)
+                needed = max(cc.values()) - cc[minority_label]
+                
+                mask = (y_syn == minority_label)
+                X_syn_filt = X_syn[mask]
+                
+                if len(X_syn_filt) > 0:
+                    X_syn = X_syn_filt[:needed]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                else:
+                    X_aug, y_aug = X_tr, y_tr
             except Exception as e:
-                print(f"  └─ MAT-Diff training FAILED: {e} ✗")
-                matdiff_trained = False
+                print(f"FAIL: {e}")
+                X_aug, y_aug = X_tr, y_tr
 
         # 3. METHOD EVALUATION LOOP
-        for method in ALL_METHODS:
-            print(f"\n  ┌─ Method: {method}")
+        # 3. SEED LOOP (outer loop)
+        for seed in range(n_seeds):
+            print(f"\n  [Seed {seed+1}/{n_seeds}]")
             
-            method_results = {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES}
+            # Create THIS seed's 80/20 split
+            from sklearn.model_selection import train_test_split
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
+            )
+            
+            # 4. METHOD LOOP (inner loop)
+            for method in ALL_METHODS:
+                print(f"    [{method}]", end=" ", flush=True)
+                
+                if method not in method_results:
+                    method_results[method] = {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES}
             fidelity = {"MMD": [], "KS": []}
             privacy = {"DCR": [], "MIA": []}
 
@@ -1249,6 +1269,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
