@@ -1082,10 +1082,9 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                     X_aug, y_aug = X_tr, y_tr
                     
                 elif variant_name == "w/o Fisher":
-                    # Use config.py-derived d_model (correct size)
-                    d_model = cfg["d_model"]
+                    d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
                     n_blocks, n_phases = 2, 1
-                    d_hidden, lr, epochs = cfg["d_hidden"], 2e-4, cfg["epochs"]
+                    lr, epochs = 2e-4, cfg["epochs"]  # ← Only change: lr=2e-4
                     
                 elif variant_name == "w/o Geodesic":
                     d_model = cfg["d_model"]
@@ -1248,6 +1247,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
