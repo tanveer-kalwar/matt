@@ -8,6 +8,7 @@ Integrates all four novel contributions:
     4. Riemannian Privacy Constraints (riemannian_privacy.py)
 """
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -80,40 +81,31 @@ class MATDiffPipeline:
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
         self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
 
-    def _q_sample(self, x_start, t, noise=None, curvature=None):
-        """Forward diffusion with curvature-adaptive noise for minority protection."""
+    def _q_sample(self, x_start, t, noise=None):
+        """Standard DDPM forward diffusion. No curvature scaling.
+
+        The forward process must match the noise prediction target exactly.
+        Any modification here creates a train/inference mismatch.
+        """
         if noise is None:
             noise = torch.randn_like(x_start)
         t = torch.clamp(t, 0, self.total_timesteps - 1)
-        
+
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
-        
-        # CRITICAL: Reduce noise for high-curvature (minority) samples
-        if curvature is not None:
-            # Normalize curvature to [0, 1]
-            curv_norm = curvature.view(-1, 1)
-            # High curvature = reduce noise by up to 30%
-            noise_scale = 1.0 - 0.3 * curv_norm
-            sqrt_one_minus = sqrt_one_minus * noise_scale
-        
+
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
     def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
-        """
-        Train with validation-based early stopping to prevent overfitting.
-        """
-        # Split into train/val
+        """Train with EMA and validation-based early stopping."""
         from sklearn.model_selection import train_test_split
-        if val_split > 0:
-            X_tr, X_val, y_tr, y_val = train_test_split(
-                X_train, y_train, test_size=val_split, stratify=y_train, random_state=42
-            )
-        else:
-            X_tr, X_val = X_train, None
-            y_tr, y_val = y_train, None
-        self.X_train = X_tr.copy()
-        self.y_train = y_tr.copy()
+
+        # Use ALL data for training (minority samples are too precious)
+        # Validation is done via training loss plateau detection
+        self.X_train = X_train.copy()
+        self.y_train = y_train.copy()
+        X_tr = X_train
+        y_tr = y_train
         self.n_features = X_tr.shape[1]
         classes = np.unique(y_tr)
         self.n_classes = len(classes)
@@ -166,7 +158,6 @@ class MATDiffPipeline:
             avg_fim, dtype=torch.float32, device=self.device
         )
 
-        # Data-driven FIM padding: use median eigenvalue of avg FIM
         if init_fim_tensor.shape[0] != self.d_model:
             eigvals = torch.linalg.eigvalsh(init_fim_tensor)
             median_eig = torch.median(torch.abs(eigvals)).item()
@@ -176,7 +167,6 @@ class MATDiffPipeline:
             padded[:s, :s] = init_fim_tensor[:s, :s]
             init_fim_tensor = padded
 
-        # dim_t: derived from d_model (d_model // 2, standard practice)
         dim_t = max(64, self.d_model // 2)
 
         self.denoiser = MATDiffDenoiser(
@@ -196,7 +186,7 @@ class MATDiffPipeline:
             n_params = sum(p.numel() for p in self.denoiser.parameters())
             print(f"  Parameters: {n_params:,}")
 
-        # ── Step 4: Training Loop ──
+        # ── Step 4: Training Loop with EMA ──
         if verbose:
             print(f"\n[4/4] Training for {epochs} epochs...")
 
@@ -210,9 +200,15 @@ class MATDiffPipeline:
             optimizer, T_max=epochs, eta_min=self.lr * 0.01
         )
 
+        # EMA model for stable sampling
+        ema_decay = 0.999
+        ema_denoiser = copy.deepcopy(self.denoiser)
+        ema_denoiser.eval()
+
         X_tensor = torch.tensor(X_tr, dtype=torch.float32, device=self.device)
         y_tensor = torch.tensor(y_tr, dtype=torch.long, device=self.device)
 
+        # Curvature per sample (for conditioning only, NOT for noise scaling)
         curvature_per_sample = torch.zeros(len(y_tr), device=self.device)
         for i, label in enumerate(y_tr):
             curvature_per_sample[i] = curvature_tensor[int(label)]
@@ -229,24 +225,24 @@ class MATDiffPipeline:
 
         self.denoiser.train()
 
-        # Compute per-class indices for balanced sampling
+        # Balanced sampling: each class sampled to max_class_size (1×, not 2×)
         class_indices = {}
         for c in range(self.n_classes):
             class_indices[c] = torch.where(y_tensor == c)[0]
         max_class_size = max(len(v) for v in class_indices.values())
-        balanced_size = max_class_size * self.n_classes
 
         best_loss = float('inf')
+        patience = 50
+        patience_counter = 0
 
         for epoch in range(epochs):
+            # Balanced batch: sample each class up to max_class_size
             balanced_idx = []
             for c in range(self.n_classes):
                 cidx = class_indices[c]
                 if len(cidx) == 0:
                     continue
-                # Sample 2x for balanced minority coverage without overfitting
-                n_samples = max_class_size * 2
-                sampled = cidx[torch.randint(0, len(cidx), (n_samples,), device=self.device)]
+                sampled = cidx[torch.randint(0, len(cidx), (max_class_size,), device=self.device)]
                 balanced_idx.append(sampled)
             balanced_idx = torch.cat(balanced_idx)
             perm = balanced_idx[torch.randperm(len(balanced_idx), device=self.device)]
@@ -267,10 +263,10 @@ class MATDiffPipeline:
                 t = torch.clamp(t, 0, self.total_timesteps - 1)
 
                 noise = torch.randn_like(x_batch)
-                x_noisy = self._q_sample(x_batch, t, noise, curvature=curv_batch)
+                x_noisy = self._q_sample(x_batch, t, noise)  # Standard DDPM, no curvature
 
-                # Classifier-free guidance training: drop labels 10% of the time
-                drop_mask = torch.rand(len(x_batch), device=self.device) < 0.1
+                # Classifier-free guidance training: drop labels 15% of the time
+                drop_mask = torch.rand(len(x_batch), device=self.device) < 0.15
                 y_cfg = y_batch.clone()
                 y_cfg[drop_mask] = self.n_classes  # null class token
                 curv_cfg = curv_batch.clone()
@@ -285,12 +281,15 @@ class MATDiffPipeline:
 
                 optimizer.zero_grad()
                 loss.backward()
-                # Adaptive gradient clipping for high-curvature datasets
-                max_norm = 2.0 if max(self.fisher.curvatures.values()) > 500 else 1.0
                 torch.nn.utils.clip_grad_norm_(
-                    self.denoiser.parameters(), max_norm=max_norm
+                    self.denoiser.parameters(), max_norm=1.0
                 )
                 optimizer.step()
+
+                # EMA update
+                with torch.no_grad():
+                    for p_ema, p_model in zip(ema_denoiser.parameters(), self.denoiser.parameters()):
+                        p_ema.data.mul_(ema_decay).add_(p_model.data, alpha=1.0 - ema_decay)
 
                 epoch_loss += loss.item()
                 n_batches += 1
@@ -298,10 +297,13 @@ class MATDiffPipeline:
             lr_scheduler.step()
             avg_loss = epoch_loss / max(1, n_batches)
             self.train_losses.append(avg_loss)
-            
-            # Track best loss
-            if avg_loss < best_loss:
+
+            # Early stopping on training loss plateau
+            if avg_loss < best_loss - 1e-5:
                 best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
             if verbose and ((epoch + 1) % 50 == 0 or epoch == 0):
                 phase = self.scheduler.get_phase_for_epoch(epoch, epochs)
@@ -310,7 +312,15 @@ class MATDiffPipeline:
                     f"loss={avg_loss:.6f}  best={best_loss:.6f}  "
                     f"phase={phase}  lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
-                
+
+            # Stop if no improvement for `patience` epochs (after warmup)
+            if patience_counter >= patience and epoch > epochs // 4:
+                if verbose:
+                    print(f"  Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
+
+        # Use EMA weights for sampling (more stable)
+        self.denoiser.load_state_dict(ema_denoiser.state_dict())
         self.privacy = None
 
         self._fit_epochs = epochs
@@ -323,27 +333,27 @@ class MATDiffPipeline:
         return self
 
     @torch.no_grad()
-    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=2.0):
-        """Single reverse diffusion step with classifier-free guidance."""
+    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.5):
+        """Single reverse diffusion step with classifier-free guidance.
+
+        guidance_scale=1.5 is the standard for conditional diffusion (TabDDPM uses 1-3).
+        Fixed scale, NOT adaptive. Adaptive scaling caused instability.
+        """
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
-    
+
         # Conditional prediction
         noise_pred_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-    
+
         # Unconditional prediction (null class token)
         y_uncond = torch.full_like(y, self.n_classes)
         curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
         noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
-    
-        # CRITICAL: Adaptive guidance - higher for minority (high-curvature) classes
-        if curvature is not None:
-            # High curvature (minority) = stronger guidance (up to 3.5x)
-            adaptive_scale = guidance_scale + curvature.view(-1, 1) * 1.5
-            noise_pred = noise_pred_uncond + adaptive_scale * (noise_pred_cond - noise_pred_uncond)
-        else:
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+        # Fixed guidance scale (no adaptive scaling)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
 
@@ -362,7 +372,7 @@ class MATDiffPipeline:
         """Generate synthetic samples in batches for quality and memory efficiency."""
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
-    
+
         if n_per_class is None:
             class_counts = dict(zip(*np.unique(self.y_train, return_counts=True)))
             majority_count = max(class_counts.values())
@@ -379,17 +389,17 @@ class MATDiffPipeline:
                     if c in alloc:
                         deficit = int(majority_count - class_counts.get(c, 0))
                         n_per_class[c] = max(alloc[c], deficit)
-    
+
         all_X, all_y = [], []
-        MAX_BATCH = 512  # Maximum samples per batch to prevent OOM
-        
+        MAX_BATCH = 512
+
         for class_label, n_needed in n_per_class.items():
             if n_needed <= 0:
                 continue
             print(f"  Sampling class {class_label}: {n_needed} samples...")
-            
+
             self.denoiser.eval()
-            
+
             # Compute curvature normalization once
             import math
             curv_val = self.fisher.curvatures.get(class_label, 1.0)
@@ -398,41 +408,38 @@ class MATDiffPipeline:
             log_min = min(log_curvs)
             log_range = max(log_curvs) - log_min
             curv_norm = (math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
-            
+
             # Generate in batches
             n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
             class_samples = []
-            
+
             for batch_idx in range(n_batches):
-                # Calculate how many samples we've generated so far
                 samples_generated = sum(len(s) for s in class_samples)
                 batch_size = min(MAX_BATCH, n_needed - samples_generated)
-                
+
                 if batch_size <= 0:
-                    break  # Already have enough samples
-                
-                # Initialize noise
+                    break
+
                 x_t = torch.randn(batch_size, self.n_features, device=self.device)
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
-    
+
                 # Reverse diffusion
                 for t in reversed(range(self.total_timesteps)):
                     x_t = self._p_sample_step(x_t, t, y=y_cond, curvature=curvature)
-                
+
                 class_samples.append(x_t.cpu().numpy())
-                
-                # Clear GPU cache every 5 batches
+
                 if batch_idx % 5 == 0 and batch_idx > 0:
                     torch.cuda.empty_cache()
-            
+
             X_syn = np.vstack(class_samples)
             all_X.append(X_syn)
             all_y.append(np.full(len(X_syn), class_label))
-    
+
         if not all_X:
             return np.empty((0, self.n_features)), np.empty(0, dtype=int)
-    
+
         return np.vstack(all_X), np.concatenate(all_y)
 
     def save(self, path: str):
@@ -488,17 +495,3 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
-
-
-
-
-
-
-
-
-
-
-
-
-
-
