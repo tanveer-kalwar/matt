@@ -23,6 +23,7 @@ class FisherInformationEstimator:
         self.class_covs: Dict[int, np.ndarray] = {}
         self.n_classes = 0
         self._regularizations: Dict[int, float] = {}
+        self._class_counts: Dict[int, int] = {}
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "FisherInformationEstimator":
         """Estimate per-class FIM with data-driven regularization.
@@ -38,11 +39,11 @@ class FisherInformationEstimator:
         for c in classes:
             X_c = X[y == c]
             n_c = len(X_c)
+            self._class_counts[int(c)] = n_c
             mu_c = np.mean(X_c, axis=0)
             self.class_means[int(c)] = mu_c
 
             if n_c < 2:
-                # Degenerate: use global covariance scaled estimate
                 reg = 1.0 / (d * max(1, len(X)))
                 cov_c = np.eye(d) * reg
             else:
@@ -50,12 +51,10 @@ class FisherInformationEstimator:
                 if cov_c.ndim == 0:
                     cov_c = np.array([[cov_c]])
 
-                # Data-driven regularization:
-                # lambda = median(diag(Sigma)) / n_c
                 diag_var = np.diag(cov_c)
                 diag_var = np.maximum(diag_var, 0)
                 median_var = np.median(diag_var) if len(diag_var) > 0 else 1.0
-                reg = max(median_var / n_c, 1e-10)  # 1e-10 is machine-precision floor
+                reg = max(median_var / n_c, 1e-10)
                 cov_c = cov_c + np.eye(d) * reg
 
             self._regularizations[int(c)] = reg
@@ -76,17 +75,42 @@ class FisherInformationEstimator:
         return self
 
     def get_loss_weights(self) -> Dict[int, float]:
-        """Per-class loss weights proportional to curvature.
+        """Per-class loss weights: inverse-frequency × curvature modulation.
 
-        Normalization: weights sum to n_classes, so average weight = 1.0.
-        This preserves the overall loss magnitude while re-distributing
-        capacity toward geometrically complex classes.
+        Base weight = n_total / (n_classes * n_c)  [standard inverse frequency]
+        Curvature modulation = (curv_c / mean_curv) ^ 0.25  [gentle curvature scaling]
+        Final weight = base * modulation, normalized so mean = 1.0
+
+        The 0.25 exponent provides a gentle curvature adjustment without
+        overwhelming the inverse-frequency signal. This follows the principle
+        of effective number of samples (Cui et al., CVPR 2019).
         """
-        total = sum(self.curvatures.values())
-        if total < 1e-12:
+        if not self._class_counts:
             return {c: 1.0 for c in self.curvatures}
-        return {c: (curv / total) * self.n_classes
-                for c, curv in self.curvatures.items()}
+
+        n_total = sum(self._class_counts.values())
+        n_cls = len(self._class_counts)
+
+        # Inverse frequency base weights
+        base_weights = {}
+        for c, n_c in self._class_counts.items():
+            base_weights[c] = n_total / (n_cls * max(n_c, 1))
+
+        # Curvature modulation (gentle)
+        mean_curv = np.mean(list(self.curvatures.values())) if self.curvatures else 1.0
+        mean_curv = max(mean_curv, 1e-12)
+
+        raw_weights = {}
+        for c in self._class_counts:
+            curv_ratio = self.curvatures.get(c, mean_curv) / mean_curv
+            modulation = curv_ratio ** 0.25  # gentle curvature scaling
+            raw_weights[c] = base_weights[c] * modulation
+
+        # Normalize: mean weight = 1.0
+        mean_w = np.mean(list(raw_weights.values()))
+        if mean_w < 1e-12:
+            return {c: 1.0 for c in self._class_counts}
+        return {c: w / mean_w for c, w in raw_weights.items()}
 
     def get_augmentation_allocation(
         self, total_budget: int, class_counts: Dict[int, int]
