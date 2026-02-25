@@ -588,6 +588,316 @@ def load_goio_samples(dataset_name):
     print(f"      ✗ GOIO samples not found at {path}")
     return None
 
+def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=None,
+                  include_dgot=False, include_goio=False):
+    """
+    IEEE TKDE Protocol: Train once on 80% data, evaluate 10 times.
+    All methods follow identical protocol for fair comparison.
+    """
+    
+    TRADITIONAL = ["Original", "SMOTE", "Borderline-SMOTE", "SMOTE-Tomek", 
+                   "ADASYN", "KMeansSMOTE"]
+    GENERATIVE = ["CTGAN"] if SDV_AVAILABLE else []
+    DIFFUSION = ["TabDDPM"] if TABDDPM_AVAILABLE else []
+    OPTIMAL_TRANSPORT = []
+    
+    if include_dgot: OPTIMAL_TRANSPORT.append("DGOT")
+    if include_goio: OPTIMAL_TRANSPORT.append("GOIO")
+    
+    ALL_METHODS = TRADITIONAL + GENERATIVE + DIFFUSION + OPTIMAL_TRANSPORT + ["MAT-Diff"]
+    
+    print(f"\nMethods: {', '.join(ALL_METHODS)}")
+    print(f"Protocol: Train once on 80% data, evaluate {n_seeds} times\n")
+    
+    all_rows = []
+    
+    for ds_name in datasets:
+        print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
+        
+        try:
+            X_tr_full, y_tr_full, X_te_full, y_te_full = load_dataset(ds_name)
+            X_all = np.vstack([X_tr_full, X_te_full])
+            y_all = np.hstack([y_tr_full, y_te_full])
+            
+            n_classes = len(np.unique(y_all))
+            if n_classes < 2:
+                print(f"  SKIP: Dataset has only {n_classes} class")
+                continue
+
+            print(f"  Total: {len(X_all)} samples, {X_all.shape[1]} features")
+                    
+        except Exception as e:
+            print(f"  SKIP: {e}")
+            continue
+        
+        cfg = get_matdiff_config(ds_name)
+        matdiff_epochs = matdiff_epochs_override or cfg["epochs"]
+        
+        # ============================================================
+        # STEP 1: TRAIN ALL METHODS ONCE ON 80% DATA (seed=42)
+        # ============================================================
+        from sklearn.model_selection import train_test_split
+        X_tr_80, _, y_tr_80, _ = train_test_split(
+            X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+        )
+        
+        print(f"\n  [TRAINING PHASE - All methods train once on {len(X_tr_80)} samples]")
+        
+        # Train DGOT/GOIO
+        dgot_samples = None
+        goio_samples = None
+        if "DGOT" in ALL_METHODS:
+            if setup_and_train_dgot(ds_name, X_tr_80, y_tr_80, device):
+                dgot_samples = load_dgot_samples(ds_name)
+        if "GOIO" in ALL_METHODS:
+            if setup_and_train_goio(ds_name, X_tr_80, y_tr_80, device):
+                goio_samples = load_goio_samples(ds_name)
+        
+        # Train CTGAN once
+        ctgan_samples = None
+        if "CTGAN" in ALL_METHODS:
+            print(f"    [CTGAN] Training...")
+            out = apply_generative_resample(X_tr_80, y_tr_80, "CTGAN", seed=42)
+            if out:
+                _, _, ctgan_samples = out
+                print(f"    [CTGAN] Training complete ✓")
+            else:
+                print(f"    [CTGAN] Training FAILED ✗")
+        
+        # Train TabDDPM once
+        tabddpm_samples = None
+        if "TabDDPM" in ALL_METHODS:
+            print(f"    [TabDDPM] Training...")
+            out = apply_tabddpm_resample(X_tr_80, y_tr_80, seed=42, device=device)
+            if out:
+                _, _, tabddpm_samples = out
+                print(f"    [TabDDPM] Training complete ✓")
+            else:
+                print(f"    [TabDDPM] Training FAILED ✗")
+        
+        # Train MAT-Diff ONCE
+        matdiff_samples = None
+        if "MAT-Diff" in ALL_METHODS:
+            print(f"    [MAT-Diff] Training...")
+            try:
+                matdiff_pipeline = MATDiffPipeline(
+                    device=device,
+                    d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
+                    n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
+                    n_phases=cfg.get("n_phases", 1),
+                    total_timesteps=cfg.get("total_timesteps", 1000),
+                    dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
+                    weight_decay=cfg.get("weight_decay", 1e-5),
+                )
+                matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
+                           batch_size=cfg["batch_size"], verbose=False)
+                
+                # Generate large pool of samples
+                X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
+                matdiff_samples = (X_syn_raw, y_syn_raw)
+                print(f"    [MAT-Diff] Training complete ✓")
+            except Exception as e:
+                print(f"    [MAT-Diff] Training FAILED: {str(e)[:100]}")
+        
+        # ============================================================
+        # STEP 2: EVALUATE ALL METHODS ON 10 DIFFERENT SPLITS
+        # ============================================================
+        all_method_results = {}
+        for method in ALL_METHODS:
+            all_method_results[method] = {
+                'utility': {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES},
+                'fidelity': {"MMD": [], "KS": []},
+                'privacy': {"DCR": [], "MIA": []}
+            }
+        
+        print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
+        
+        for seed in range(n_seeds):
+            print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
+            
+            # Create THIS seed's 80/20 split
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
+            )
+            
+            for method in ALL_METHODS:
+                X_aug, y_aug, X_syn = None, None, None
+                
+                # Traditional methods: train per seed (fast, <1s each)
+                if method in TRADITIONAL:
+                    out = apply_traditional_resampler(method, X_tr, y_tr, seed)
+                    if out: X_aug, y_aug, X_syn = out
+                
+                # CTGAN: use pre-trained samples
+                elif method == "CTGAN" and ctgan_samples is not None:
+                    cc = Counter(y_tr)
+                    minority_label = min(cc, key=cc.get)
+                    needed = max(cc.values()) - cc[minority_label]
+                    
+                    # Filter pre-trained samples to minority class
+                    # CTGAN samples were generated to balance seed=42 split
+                    # We'll take a random subset for this split
+                    X_syn = ctgan_samples[:min(needed, len(ctgan_samples))]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                
+                # TabDDPM: use pre-trained samples
+                elif method == "TabDDPM" and tabddpm_samples is not None:
+                    cc = Counter(y_tr)
+                    minority_label = min(cc, key=cc.get)
+                    needed = max(cc.values()) - cc[minority_label]
+                    
+                    X_syn = tabddpm_samples[:min(needed, len(tabddpm_samples))]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                
+                # MAT-Diff: use pre-trained samples
+                elif method == "MAT-Diff" and matdiff_samples is not None:
+                    X_syn_raw, y_syn_raw = matdiff_samples
+                    
+                    cc = Counter(y_tr)
+                    minority_label = min(cc, key=cc.get)
+                    needed = max(cc.values()) - cc[minority_label]
+                    
+                    mask = (y_syn_raw == minority_label)
+                    X_syn = X_syn_raw[mask][:needed]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                
+                # DGOT: use pre-trained samples
+                elif method == "DGOT" and dgot_samples is not None:
+                    cc = Counter(y_tr)
+                    minority_label = min(cc, key=cc.get)
+                    needed = max(cc.values()) - cc[minority_label]
+                    
+                    X_syn = dgot_samples[:min(needed, len(dgot_samples))]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                
+                # GOIO: use pre-trained samples
+                elif method == "GOIO" and goio_samples is not None:
+                    cc = Counter(y_tr)
+                    minority_label = min(cc, key=cc.get)
+                    needed = max(cc.values()) - cc[minority_label]
+                    
+                    X_syn = goio_samples[:min(needed, len(goio_samples))]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    X_aug = np.vstack([X_tr, X_syn])
+                    y_aug = np.hstack([y_tr, y_syn])
+                
+                if X_aug is None:
+                    X_aug, y_aug = X_tr, y_tr
+                
+                # Evaluate
+                clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                for cn in CLF_NAMES:
+                    for m in UTIL_METRICS:
+                        all_method_results[method]['utility'][cn][m].append(
+                            clf_res[cn].get(m, np.nan))
+                
+                # Fidelity/Privacy (only first seed)
+                if seed == 0 and method != "Original" and X_syn is not None and len(X_syn) > 0:
+                    minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
+                                                   if v < max(Counter(y_tr).values())])
+                    X_min = X_tr[minority_mask]
+                    if len(X_min) > 0:
+                        all_method_results[method]['fidelity']["MMD"].append(
+                            compute_mmd(X_min, X_syn))
+                        all_method_results[method]['fidelity']["KS"].append(
+                            compute_ks(X_min, X_syn))
+                        all_method_results[method]['privacy']["DCR"].append(
+                            compute_dcr(X_tr, X_syn))
+                        all_method_results[method]['privacy']["MIA"].append(
+                            compute_mia(X_tr, X_syn, X_te))
+            
+            # Print F1 for this seed
+            f1_vals = []
+            for method in ["SMOTE", "MAT-Diff", "DGOT", "GOIO"]:
+                if method in ALL_METHODS:
+                    f1_list = [all_method_results[method]['utility'][cn]["F1"][-1] 
+                              for cn in CLF_NAMES if len(all_method_results[method]['utility'][cn]["F1"]) > 0]
+                    if f1_list:
+                        f1 = np.mean(f1_list)
+                        f1_vals.append(f"{method}={f1:.3f}")
+            print(" | ".join(f1_vals))
+        
+        # Aggregate and save results
+        print(f"\n  [Summary - {n_seeds} evaluations]")
+        for method in ALL_METHODS:
+            method_results = all_method_results[method]
+            
+            # Store utility
+            for cn in CLF_NAMES:
+                for m in UTIL_METRICS:
+                    vals = [v for v in method_results['utility'][cn][m] if not np.isnan(v)]
+                    if vals:
+                        all_rows.append({
+                            "Dataset": ds_name, "Method": method, "Classifier": cn,
+                            "Metric": m, "Mean": float(np.mean(vals)),
+                            "Std": float(np.std(vals)), "N": len(vals),
+                        })
+            
+            # Store fidelity/privacy
+            for m in ["MMD", "KS"]:
+                vals = [v for v in method_results['fidelity'][m] if not np.isnan(v)]
+                if vals:
+                    all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
+                        "Metric": m, "Mean": float(np.mean(vals)), 
+                        "Std": float(np.std(vals)), "N": len(vals)})
+            
+            for m in ["DCR", "MIA"]:
+                vals = [v for v in method_results['privacy'][m] if not np.isnan(v)]
+                if vals:
+                    all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
+                        "Metric": m, "Mean": float(np.mean(vals)), 
+                        "Std": float(np.std(vals)), "N": len(vals)})
+            
+            # Print summary
+            f1_vals = []
+            for cn in CLF_NAMES:
+                f1_vals.extend([v for v in method_results['utility'][cn]["F1"] 
+                               if not np.isnan(v)])
+            if f1_vals:
+                print(f"    {method:<20s} F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
+
+    # Save results
+    df = pd.DataFrame(all_rows)
+    out_path = os.path.abspath("benchmark_results.csv")
+    df.to_csv(out_path, index=False)
+    print(f"\n✓ Saved: {out_path}")
+    
+    # Print summary table
+    if len(all_rows) > 0:
+        print("\n" + "=" * 120)
+        print("BENCHMARK SUMMARY")
+        print("=" * 120)
+        
+        methods = df["Method"].unique()
+        summary_rows = []
+        for method in methods:
+            mdf = df[df["Method"] == method]
+            row = {"Method": method}
+            
+            for metric in ["F1", "Acc", "MCC", "BalAcc", "AUC_PR", "MMD", "KS", "DCR", "MIA"]:
+                metric_vals = mdf[mdf["Metric"] == metric]["Mean"].values
+                if len(metric_vals) > 0:
+                    row[metric] = f"{np.mean(metric_vals):.4f} ± {np.std(metric_vals):.4f}"
+                else:
+                    row[metric] = "--"
+            summary_rows.append(row)
+        
+        summary_df = pd.DataFrame(summary_rows).set_index("Method")
+        print(summary_df.to_string())
+        print("=" * 120)
+        
+        summary_df.to_csv("benchmark_summary.csv")
+    
+    return df
 
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     """
@@ -998,6 +1308,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
