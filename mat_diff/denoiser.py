@@ -2,12 +2,12 @@
 MAT-Diff Denoiser: MLP backbone with Geodesic Attention blocks.
 
 Architecture:
-    Input → Project → [TimeEmbed + ClassEmbed + CurvatureEmbed] →
+    Input → Project → [AdaLN conditioning from Time+Class+Curvature] →
     GeodesicAttention → MLP Block → GeodesicAttention → MLP Block →
     Output Head → ε̂ (predicted noise)
 
-The curvature embedding injects per-class geometric information,
-allowing the denoiser to adapt its behavior based on manifold complexity.
+Uses Adaptive Layer Normalization (AdaLN) from DiT (Peebles & Xie, 2023)
+for conditioning instead of simple additive embeddings.
 """
 
 import math
@@ -20,16 +20,7 @@ from .geodesic_attention import GeodesicAttentionBlock
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-    """Sinusoidal timestep embeddings (from DDPM).
-
-    Args:
-        timesteps: 1-D Tensor of N timestep indices.
-        dim: Embedding dimension.
-        max_period: Controls minimum frequency.
-
-    Returns:
-        Tensor of shape (N, dim).
-    """
+    """Sinusoidal timestep embeddings (from DDPM)."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
@@ -45,30 +36,49 @@ def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 1000
     return embedding
 
 
-class MLPBlock(nn.Module):
-    """Standard MLP block with residual connection.
+class AdaLN(nn.Module):
+    """Adaptive Layer Normalization.
 
-    Architecture: Linear → LayerNorm → SiLU → Dropout → Linear → Residual
+    Modulates LayerNorm output with learned scale and shift from conditioning.
+    From DiT (Peebles & Xie, ICCV 2023).
     """
+    def __init__(self, d_model: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 2 * d_model),
+        )
+        # Initialize to identity: scale=1, shift=0
+        nn.init.zeros_(self.proj[1].weight)
+        nn.init.zeros_(self.proj[1].bias)
 
-    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1):
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale_shift = self.proj(cond)
+        scale, shift = scale_shift.chunk(2, dim=-1)
+        return self.norm(x) * (1 + scale) + shift
+
+
+class MLPBlock(nn.Module):
+    """MLP block with AdaLN conditioning and residual connection."""
+
+    def __init__(self, d_model: int, d_hidden: int, cond_dim: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_hidden),
-            nn.LayerNorm(d_hidden),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(d_hidden, d_model),
             nn.Dropout(dropout),
         )
-        self.norm = nn.LayerNorm(d_model)
+        self.adaln = AdaLN(d_model, cond_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x + self.net(x))
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        return self.adaln(x + self.net(x), cond)
 
 
 class MATDiffDenoiser(nn.Module):
-    """MAT-Diff denoiser with geodesic attention and curvature conditioning.
+    """MAT-Diff denoiser with geodesic attention and AdaLN conditioning.
 
     Args:
         d_in: Input feature dimension (number of tabular features).
@@ -104,57 +114,69 @@ class MATDiffDenoiser(nn.Module):
         self.num_classes = num_classes
         self.use_curvature = use_curvature
 
+        # Conditioning dimension
+        cond_dim = d_model
+
         # Input projection
         self.input_proj = nn.Sequential(
             nn.Linear(d_in, d_model),
-            nn.LayerNorm(d_model),
             nn.SiLU(),
         )
 
-        # Time embedding
+        # Time embedding → conditioning vector
         self.time_embed = nn.Sequential(
             nn.Linear(dim_t, d_model),
             nn.SiLU(),
             nn.Linear(d_model, d_model),
         )
 
-        # Class embedding (for conditional generation)
+        # Class embedding
         if num_classes > 0:
             self.class_embed = nn.Embedding(num_classes, d_model)
         else:
             self.class_embed = None
 
-        # Curvature embedding (novel: injects geometric complexity info)
+        # Curvature embedding
         if use_curvature and num_classes > 0:
             self.curvature_proj = nn.Sequential(
-                nn.Linear(1, d_model),
+                nn.Linear(1, d_model // 4),
                 nn.SiLU(),
-                nn.Linear(d_model, d_model),
+                nn.Linear(d_model // 4, d_model),
             )
         else:
             self.curvature_proj = None
 
-        # Core blocks: alternating GeodesicAttention and MLP
-        self.blocks = nn.ModuleList()
+        # Conditioning fusion: combine time + class + curvature → single cond vector
+        n_cond_sources = 1  # time is always present
+        if num_classes > 0:
+            n_cond_sources += 1
+        if use_curvature and num_classes > 0:
+            n_cond_sources += 1
+        self.cond_fusion = nn.Sequential(
+            nn.Linear(d_model * n_cond_sources, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Core blocks: GeodesicAttention + conditioned MLP
+        self.attn_blocks = nn.ModuleList()
+        self.mlp_blocks = nn.ModuleList()
+        self.attn_adalns = nn.ModuleList()
         for _ in range(n_blocks):
-            self.blocks.append(
-                nn.ModuleDict({
-                    "attention": GeodesicAttentionBlock(
-                        d_model=d_model,
-                        n_heads=n_heads,
-                        dropout=dropout,
-                        init_fim=init_fim,
-                    ),
-                    "mlp": MLPBlock(d_model, d_hidden, dropout),
-                })
+            self.attn_blocks.append(
+                GeodesicAttentionBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    init_fim=init_fim,
+                )
             )
+            self.attn_adalns.append(AdaLN(d_model, cond_dim))
+            self.mlp_blocks.append(MLPBlock(d_model, d_hidden, cond_dim, dropout))
 
         # Output head
-        self.output_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_in),
-        )
+        self.output_norm = AdaLN(d_model, cond_dim)
+        self.output_proj = nn.Linear(d_model, d_in)
 
     def forward(
         self,
@@ -163,41 +185,38 @@ class MATDiffDenoiser(nn.Module):
         y: Optional[torch.Tensor] = None,
         curvature: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass: predict noise ε given noisy x_t, timestep t, class y.
-
-        Args:
-            x: Noisy input of shape (B, d_in).
-            timesteps: Timestep indices of shape (B,).
-            y: Class labels of shape (B,) or None.
-            curvature: Per-sample curvature values of shape (B,) or None.
-
-        Returns:
-            Predicted noise of shape (B, d_in).
-        """
+        """Forward pass with AdaLN conditioning."""
         # Project input
         h = self.input_proj(x)
 
-        # Add time embedding
-        t_emb = self.time_embed(timestep_embedding(timesteps, self.dim_t))
-        h = h + t_emb
+        # Build conditioning vector
+        cond_parts = []
 
-        # Add class embedding
+        # Time embedding (always present)
+        t_emb = self.time_embed(timestep_embedding(timesteps, self.dim_t))
+        cond_parts.append(t_emb)
+
+        # Class embedding
         if self.class_embed is not None and y is not None:
             y_int = y.long().view(-1)
             y_int = torch.clamp(y_int, 0, self.num_classes - 1)
             c_emb = self.class_embed(y_int)
-            h = h + F.silu(c_emb)
+            cond_parts.append(c_emb)
 
-        # Add curvature embedding (novel)
+        # Curvature embedding
         if self.curvature_proj is not None and curvature is not None:
-            curv_input = curvature.float().unsqueeze(-1)  # (B, 1)
+            curv_input = curvature.float().unsqueeze(-1)
             curv_emb = self.curvature_proj(curv_input)
-            h = h + curv_emb
+            cond_parts.append(curv_emb)
 
-        # Process through Geodesic Attention + MLP blocks
-        for block in self.blocks:
-            h = block["attention"](h)
-            h = block["mlp"](h)
+        # Fuse conditioning
+        cond = self.cond_fusion(torch.cat(cond_parts, dim=-1))
 
-        # Predict noise
-        return self.output_head(h)
+        # Process through blocks with AdaLN conditioning
+        for attn, adaln, mlp in zip(self.attn_blocks, self.attn_adalns, self.mlp_blocks):
+            h = adaln(h + attn(h) - h, cond)  # attention with residual + AdaLN
+            h = mlp(h, cond)  # MLP with AdaLN
+
+        # Output
+        h = self.output_norm(h, cond)
+        return self.output_proj(h)
