@@ -589,261 +589,185 @@ def load_goio_samples(dataset_name):
     return None
 
 
-def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=None,
-                  include_dgot=False, include_goio=False):
-    """IEEE TKDE Protocol: 10 seeds × 5-fold CV = 50 evaluations per dataset."""
+def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
+    """
+    Ablation: Train each variant once on 80% data, evaluate 10 times.
+    Same protocol as benchmark for consistency.
+    """
     
-    TRADITIONAL = ["Original", "SMOTE", "Borderline-SMOTE", "SMOTE-Tomek", 
-                   "ADASYN", "KMeansSMOTE"]
-    GENERATIVE = ["CTGAN"] if SDV_AVAILABLE else []
-    DIFFUSION = ["TabDDPM"] if TABDDPM_AVAILABLE else []
-    OPTIMAL_TRANSPORT = []
+    print("\n" + "=" * 120)
+    print("ABLATION STUDY: Train once per variant, evaluate 10 times")
+    print("=" * 120)
     
-    if include_dgot: OPTIMAL_TRANSPORT.append("DGOT")
-    if include_goio: OPTIMAL_TRANSPORT.append("GOIO")
+    ABLATION_VARIANTS = {
+        "IDENTITY": "No oversampling",
+        "w/o Fisher": "Remove Fisher weighting (lr=2e-4)",
+        "w/o Geodesic": "Remove Geodesic Attention (n_blocks=1)",
+        "w/o Spectral": "Remove Spectral Curriculum (n_phases=1)",
+        "MAT-Diff (Ours)": "Full model with all components",
+    }
     
-    ALL_METHODS = TRADITIONAL + GENERATIVE + DIFFUSION + OPTIMAL_TRANSPORT + ["MAT-Diff"]
-    
-    print(f"\nMethods: {', '.join(ALL_METHODS)}")
-    print(f"Protocol: {n_seeds} seeds × {n_folds}-fold CV = {n_seeds * n_folds} evaluations\n")
-    
-    all_rows = []
+    all_results = []
     
     for ds_name in datasets:
+        if ds_name in {'abalone_19', 'Dry_Beans'}:
+            continue
+
         print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
-        
+
         try:
             X_tr_full, y_tr_full, X_te_full, y_te_full = load_dataset(ds_name)
             X_all = np.vstack([X_tr_full, X_te_full])
             y_all = np.hstack([y_tr_full, y_te_full])
             
-            n_classes = len(np.unique(y_all))
-            if n_classes < 2:
-                print(f"  SKIP: Dataset has only {n_classes} class")
+            if len(np.unique(y_all)) < 2:
                 continue
+            print(f"  Total: {len(X_all)} samples")
 
-            print(f"  Total: {len(X_all)} samples, {X_all.shape[1]} features")
-                    
         except Exception as e:
             print(f"  SKIP: {e}")
             continue
-        
+
         cfg = get_matdiff_config(ds_name)
-        matdiff_epochs = matdiff_epochs_override or cfg["epochs"]
+        FIXED_EPOCHS = cfg["epochs"]
         
-        # Train DGOT/GOIO once on full 80% train split
+        # Train 80% split (seed=42)
         from sklearn.model_selection import train_test_split
         X_tr_80, _, y_tr_80, _ = train_test_split(
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
         
-        dgot_trained = False
-        goio_trained = False
-        if "DGOT" in ALL_METHODS:
-            dgot_trained = setup_and_train_dgot(ds_name, X_tr_80, y_tr_80, device)
-        if "GOIO" in ALL_METHODS:
-            goio_trained = setup_and_train_goio(ds_name, X_tr_80, y_tr_80, device)
+        print(f"\n  [TRAINING PHASE - Train each variant once on {len(X_tr_80)} samples]")
         
-        # Initialize results storage
-        all_method_results = {}
-        for method in ALL_METHODS:
-            all_method_results[method] = {
-                'utility': {cn: {m: [] for m in UTIL_METRICS} for cn in CLF_NAMES},
-                'fidelity': {"MMD": [], "KS": []},
-                'privacy': {"DCR": [], "MIA": []}
-            }
+        # Train all variants ONCE
+        trained_pipelines = {}
+        for variant_name in ABLATION_VARIANTS:
+            if variant_name == "IDENTITY":
+                continue
+            
+            print(f"    [{variant_name}] Training...", end=" ", flush=True)
+            
+            # Configure variant
+            if variant_name == "w/o Fisher":
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks, n_phases = 2, 1
+                lr, epochs = 2e-4, FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+                
+            elif variant_name == "w/o Geodesic":
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks, n_phases = 1, 1
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+                
+            elif variant_name == "w/o Spectral":
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks, n_phases = 2, 1
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+                
+            else:  # MAT-Diff (Ours)
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+            
+            # Train
+            try:
+                pipeline = MATDiffPipeline(
+                    device=device, d_model=d_model, d_hidden=d_hidden,
+                    n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
+                    total_timesteps=total_timesteps, dropout=0.1, lr=lr,
+                )
+                pipeline.fit(X_tr_80, y_tr_80, epochs=epochs,
+                            batch_size=cfg["batch_size"], verbose=False)
+                trained_pipelines[variant_name] = pipeline
+                print("✓")
+            except Exception as e:
+                print(f"FAILED: {str(e)[:50]}")
         
-        # DGOT Protocol: 10 seeds × 5-fold CV
-        total_evals = 0
+        # Evaluate all variants on 10 splits
+        print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
+        
+        variant_results = {var: {'F1': [], 'Acc': [], 'MCC': []} for var in ABLATION_VARIANTS}
+        
         for seed in range(n_seeds):
-            print(f"\n  [Seed {seed+1}/{n_seeds}]")
+            print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
             
-            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
+            )
             
-            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X_all, y_all)):
-                X_tr = X_all[train_idx]
-                X_te = X_all[test_idx]
-                y_tr = y_all[train_idx]
-                y_te = y_all[test_idx]
-                
-                for method in ALL_METHODS:
-                    X_aug, y_aug, X_syn = None, None, None
-                    
-                    # Traditional methods: train per fold
-                    if method in TRADITIONAL:
-                        out = apply_traditional_resampler(method, X_tr, y_tr, seed)
-                        if out: X_aug, y_aug, X_syn = out
-                    
-                    # Generative: train per fold
-                    elif method in GENERATIVE:
-                        out = apply_generative_resample(X_tr, y_tr, method, seed)
-                        if out: X_aug, y_aug, X_syn = out
-                    
-                    # TabDDPM: train per fold
-                    elif method == "TabDDPM":
-                        out = apply_tabddpm_resample(X_tr, y_tr, seed, device)
-                        if out: X_aug, y_aug, X_syn = out
-                    
-                    # MAT-Diff: train per fold
-                    elif method == "MAT-Diff":
-                        try:
-                            matdiff_pipeline = MATDiffPipeline(
-                                device=device,
-                                d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-                                n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-                                n_phases=cfg.get("n_phases", 1),
-                                total_timesteps=cfg.get("total_timesteps", 1000),
-                                dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
-                                weight_decay=cfg.get("weight_decay", 1e-5),
-                            )
-                            matdiff_pipeline.fit(X_tr, y_tr, epochs=matdiff_epochs,
-                                       batch_size=cfg["batch_size"], verbose=False)
-                            
-                            X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
-                            
-                            cc = Counter(y_tr)
-                            minority_label = min(cc, key=cc.get)
-                            needed = max(cc.values()) - cc[minority_label]
-                            
-                            mask = (y_syn_raw == minority_label)
-                            X_syn = X_syn_raw[mask][:needed]
-                            y_syn = np.full(len(X_syn), minority_label)
-                            
-                            X_aug = np.vstack([X_tr, X_syn])
-                            y_aug = np.hstack([y_tr, y_syn])
-                        except Exception as e:
-                            print(f"    [MAT-Diff] Fold {fold_idx+1} FAIL: {str(e)[:50]}")
-                            X_aug, y_aug = X_tr, y_tr
-                    
-                    # DGOT/GOIO: use pre-trained samples
-                    elif method == "DGOT" and dgot_trained:
-                        X_syn_all = load_dgot_samples(ds_name)
-                        if X_syn_all is not None:
-                            cc = Counter(y_tr)
-                            minority_label = min(cc, key=cc.get)
-                            needed = max(cc.values()) - cc[minority_label]
-                            X_syn = X_syn_all[:needed]
-                            y_syn = np.full(len(X_syn), minority_label)
-                            X_aug = np.vstack([X_tr, X_syn])
-                            y_aug = np.hstack([y_tr, y_syn])
-                    
-                    elif method == "GOIO" and goio_trained:
-                        X_syn_all = load_goio_samples(ds_name)
-                        if X_syn_all is not None:
-                            cc = Counter(y_tr)
-                            minority_label = min(cc, key=cc.get)
-                            needed = max(cc.values()) - cc[minority_label]
-                            X_syn = X_syn_all[:needed]
-                            y_syn = np.full(len(X_syn), minority_label)
-                            X_aug = np.vstack([X_tr, X_syn])
-                            y_aug = np.hstack([y_tr, y_syn])
-                    
-                    if X_aug is None:
+            for variant_name in ABLATION_VARIANTS:
+                if variant_name == "IDENTITY":
+                    X_aug, y_aug = X_tr, y_tr
+                elif variant_name in trained_pipelines:
+                    try:
+                        pipeline = trained_pipelines[variant_name]
+                        X_syn_raw, y_syn_raw = pipeline.sample()
+                        
+                        cc = Counter(y_tr)
+                        minority_label = min(cc, key=cc.get)
+                        needed = max(cc.values()) - cc[minority_label]
+                        
+                        mask = (y_syn_raw == minority_label)
+                        X_syn = X_syn_raw[mask][:needed]
+                        y_syn = np.full(len(X_syn), minority_label)
+                        
+                        X_aug = np.vstack([X_tr, X_syn])
+                        y_aug = np.hstack([y_tr, y_syn])
+                    except Exception:
                         X_aug, y_aug = X_tr, y_tr
-                    
-                    # Evaluate
-                    clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
-                    for cn in CLF_NAMES:
-                        for m in UTIL_METRICS:
-                            all_method_results[method]['utility'][cn][m].append(
-                                clf_res[cn].get(m, np.nan))
-                    
-                    # Fidelity/Privacy (only first fold of first seed)
-                    if seed == 0 and fold_idx == 0 and method != "Original" and X_syn is not None:
-                        minority_mask = np.isin(y_tr, [k for k, v in Counter(y_tr).items()
-                                                       if v < max(Counter(y_tr).values())])
-                        X_min = X_tr[minority_mask]
-                        if len(X_min) > 0 and len(X_syn) > 0:
-                            all_method_results[method]['fidelity']["MMD"].append(
-                                compute_mmd(X_min, X_syn))
-                            all_method_results[method]['fidelity']["KS"].append(
-                                compute_ks(X_min, X_syn))
-                            all_method_results[method]['privacy']["DCR"].append(
-                                compute_dcr(X_tr, X_syn))
-                            all_method_results[method]['privacy']["MIA"].append(
-                                compute_mia(X_tr, X_syn, X_te))
+                else:
+                    X_aug, y_aug = X_tr, y_tr
                 
-                total_evals += 1
-                if fold_idx == 0:
-                    # Print F1 after first fold
-                    for method in ALL_METHODS:
-                        f1_vals = [all_method_results[method]['utility'][cn]["F1"][-1] 
-                                  for cn in CLF_NAMES]
-                        print(f"    [{method}] F1={np.mean(f1_vals):.4f}", end=" ")
-                    print()
+                # Evaluate
+                clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                
+                f1_avg = np.mean([clf_results[cn]["F1"] for cn in CLF_NAMES])
+                acc_avg = np.mean([clf_results[cn]["Acc"] for cn in CLF_NAMES])
+                mcc_avg = np.mean([clf_results[cn]["MCC"] for cn in CLF_NAMES])
+                
+                variant_results[variant_name]['F1'].append(f1_avg)
+                variant_results[variant_name]['Acc'].append(acc_avg)
+                variant_results[variant_name]['MCC'].append(mcc_avg)
+            
+            # Print F1 for this seed
+            f1_vals = [f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}" 
+                      for var in ABLATION_VARIANTS]
+            print(" | ".join(f1_vals))
         
         # Aggregate results
-        print(f"\n  [Summary - {total_evals} evaluations]")
-        for method in ALL_METHODS:
-            method_results = all_method_results[method]
+        print(f"\n  [Dataset Summary]")
+        for variant_name in ABLATION_VARIANTS:
+            f1_mean = np.mean(variant_results[variant_name]['F1'])
+            f1_std = np.std(variant_results[variant_name]['F1'])
+            acc_mean = np.mean(variant_results[variant_name]['Acc'])
+            mcc_mean = np.mean(variant_results[variant_name]['MCC'])
             
-            # Store utility
-            for cn in CLF_NAMES:
-                for m in UTIL_METRICS:
-                    vals = [v for v in method_results['utility'][cn][m] if not np.isnan(v)]
-                    if vals:
-                        all_rows.append({
-                            "Dataset": ds_name, "Method": method, "Classifier": cn,
-                            "Metric": m, "Mean": float(np.mean(vals)),
-                            "Std": float(np.std(vals)), "N": len(vals),
-                        })
+            print(f"    {variant_name:<20s} F1: {f1_mean:.4f} ± {f1_std:.4f}")
             
-            # Store fidelity/privacy
-            for m in ["MMD", "KS"]:
-                vals = [v for v in method_results['fidelity'][m] if not np.isnan(v)]
-                if vals:
-                    all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
-                        "Metric": m, "Mean": float(np.mean(vals)), 
-                        "Std": float(np.std(vals)), "N": len(vals)})
-            
-            for m in ["DCR", "MIA"]:
-                vals = [v for v in method_results['privacy'][m] if not np.isnan(v)]
-                if vals:
-                    all_rows.append({"Dataset": ds_name, "Method": method, "Classifier": "ALL",
-                        "Metric": m, "Mean": float(np.mean(vals)), 
-                        "Std": float(np.std(vals)), "N": len(vals)})
-            
-            # Print summary
-            f1_vals = []
-            for cn in CLF_NAMES:
-                f1_vals.extend([v for v in method_results['utility'][cn]["F1"] 
-                               if not np.isnan(v)])
-            if f1_vals:
-                print(f"    {method:<20s} F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
-
-    # Save results
-    df = pd.DataFrame(all_rows)
-    out_path = os.path.abspath("benchmark_results.csv")
-    df.to_csv(out_path, index=False)
-    print(f"\n✓ Saved: {out_path}")
+            all_results.append({
+                "Dataset": ds_name, "Variant": variant_name,
+                "F1_Mean": f1_mean, "F1_Std": f1_std,
+                "Acc_Mean": acc_mean, "MCC_Mean": mcc_mean
+            })
     
-    # Print summary table (keeping your existing summary code)
-    if len(all_rows) > 0:
+    # Save and display
+    if all_results:
+        df = pd.DataFrame(all_results)
+        df.to_csv("ablation_results.csv", index=False)
+        
         print("\n" + "=" * 120)
-        print("BENCHMARK SUMMARY")
+        print("ABLATION SUMMARY")
+        print("=" * 120)
+        pivot = df.pivot(index="Variant", columns="Dataset", values="F1_Mean")
+        order = ["IDENTITY", "w/o Fisher", "w/o Geodesic", "w/o Spectral", "MAT-Diff (Ours)"]
+        pivot = pivot.reindex(order)
+        print(pivot.to_string(float_format=lambda x: f"{x:.4f}"))
         print("=" * 120)
         
-        methods = df["Method"].unique()
-        summary_rows = []
-        for method in methods:
-            mdf = df[df["Method"] == method]
-            row = {"Method": method}
-            
-            for metric in ["F1", "Acc", "MCC", "BalAcc", "AUC_PR", "MMD", "KS", "DCR", "MIA"]:
-                metric_vals = mdf[mdf["Metric"] == metric]["Mean"].values
-                if len(metric_vals) > 0:
-                    row[metric] = f"{np.mean(metric_vals):.4f} ± {np.std(metric_vals):.4f}"
-                else:
-                    row[metric] = "--"
-            summary_rows.append(row)
-        
-        summary_df = pd.DataFrame(summary_rows).set_index("Method")
-        print(summary_df.to_string())
-        print("=" * 120)
-        
-        summary_df.to_csv("benchmark_summary.csv")
-    
-    return df
+    return all_results
                       
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     """IEEE TKDE Protocol: 10 seeds × 5-fold CV = 50 evaluations per variant."""
@@ -1074,6 +998,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
