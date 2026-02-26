@@ -214,9 +214,10 @@ class MATDiffDenoiser(nn.Module):
 
         # Process through blocks with AdaLN conditioning
         for attn, adaln, mlp in zip(self.attn_blocks, self.attn_adalns, self.mlp_blocks):
-            h = adaln(attn(h), cond)  # GeodesicAttention has internal residual + LayerNorm
-            h = mlp(h, cond)  # MLP with AdaLN
+            h = adaln(attn(h), cond)  # GeodesicAttention has internal residual+LN
+            h = mlp(h, cond)  # MLP with AdaLN (has internal residual)
 
         # Output
         h = self.output_norm(h, cond)
         return self.output_proj(h)
+
