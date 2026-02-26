@@ -1059,14 +1059,17 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             f1_mean = np.mean(variant_results[variant_name]['F1'])
             f1_std = np.std(variant_results[variant_name]['F1'])
             acc_mean = np.mean(variant_results[variant_name]['Acc'])
+            acc_std = np.std(variant_results[variant_name]['Acc'])
             mcc_mean = np.mean(variant_results[variant_name]['MCC'])
+            mcc_std = np.std(variant_results[variant_name]['MCC'])
             
-            print(f"    {variant_name:<20s} F1: {f1_mean:.4f} ± {f1_std:.4f}")
+            print(f"    {variant_name:<20s} F1: {f1_mean:.4f} ± {f1_std:.4f}  Acc: {acc_mean:.4f} ± {acc_std:.4f}  MCC: {mcc_mean:.4f} ± {mcc_std:.4f}")
             
             all_results.append({
                 "Dataset": ds_name, "Variant": variant_name,
                 "F1_Mean": f1_mean, "F1_Std": f1_std,
-                "Acc_Mean": acc_mean, "MCC_Mean": mcc_mean
+                "Acc_Mean": acc_mean, "Acc_Std": acc_std,
+                "MCC_Mean": mcc_mean, "MCC_Std": mcc_std,
             })
     
     # Save and display
@@ -1150,6 +1153,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
