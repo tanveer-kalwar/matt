@@ -680,11 +680,11 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         if "MAT-Diff" in ALL_METHODS:
             print(f"    [MAT-Diff] Training...")
             try:
-                matdiff_pipeline = MATDiffPipeline(
+                    matdiff_pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
                     n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-                    n_phases=cfg.get("n_phases", 1),
+                    n_phases=cfg.get("n_phases", 3),
                     total_timesteps=cfg.get("total_timesteps", 1000),
                     dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
                     weight_decay=cfg.get("weight_decay", 1e-5),
@@ -753,20 +753,32 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     X_aug = np.vstack([X_tr, X_syn])
                     y_aug = np.hstack([y_tr, y_syn])
                 
-                # MAT-Diff: use pre-trained samples
+                # MAT-Diff: use pre-trained samples (same logic as ablation)
                 elif method == "MAT-Diff" and matdiff_samples is not None:
                     X_syn_raw, y_syn_raw = matdiff_samples
                     
                     cc = Counter(y_tr)
-                    minority_label = min(cc, key=cc.get)
-                    needed = max(cc.values()) - cc[minority_label]
+                    majority_count = max(cc.values())
                     
-                    mask = (y_syn_raw == minority_label)
-                    X_syn = X_syn_raw[mask][:needed]
-                    y_syn = np.full(len(X_syn), minority_label)
+                    # Augment ALL minority classes (not just the smallest one)
+                    X_syn_parts, y_syn_parts = [], []
+                    for c_label, c_count in cc.items():
+                        if c_count < majority_count:
+                            deficit = majority_count - c_count
+                            mask = (y_syn_raw == c_label)
+                            X_c = X_syn_raw[mask][:deficit]
+                            if len(X_c) > 0:
+                                X_syn_parts.append(X_c)
+                                y_syn_parts.append(np.full(len(X_c), c_label))
                     
-                    X_aug = np.vstack([X_tr, X_syn])
-                    y_aug = np.hstack([y_tr, y_syn])
+                    if X_syn_parts:
+                        X_syn = np.vstack(X_syn_parts)
+                        y_syn = np.concatenate(y_syn_parts)
+                        X_aug = np.vstack([X_tr, X_syn])
+                        y_aug = np.hstack([y_tr, y_syn])
+                    else:
+                        X_aug, y_aug = X_tr, y_tr
+                        X_syn = None
                 
                 # DGOT: use pre-trained samples
                 elif method == "DGOT" and dgot_samples is not None:
@@ -901,8 +913,9 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
 
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     """
-    Ablation: Train each variant once on 80% data, evaluate 10 times.
-    Same protocol as benchmark for consistency.
+    Ablation: Train once on 80% data, evaluate n_seeds times.
+    Same protocol as benchmark. IDENTICAL model used for 'MAT-Diff (Ours)'.
+    Each ablation properly removes exactly ONE component.
     """
     
     print("\n" + "=" * 120)
@@ -910,10 +923,10 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     print("=" * 120)
     
     ABLATION_VARIANTS = {
-        "IDENTITY": "No oversampling",
-        "w/o Fisher": "Remove Fisher weighting (lr=2e-4)",
-        "w/o Geodesic": "Remove Geodesic Attention (n_blocks=1)",
-        "w/o Spectral": "Remove Spectral Curriculum (n_phases=1)",
+        "IDENTITY": "No oversampling baseline",
+        "w/o Fisher": "Disable Fisher loss weighting (uniform weights)",
+        "w/o Geodesic": "Replace Geodesic Attention with standard attention",
+        "w/o Spectral": "Replace Spectral Curriculum with uniform linear schedule",
         "MAT-Diff (Ours)": "Full model with all components",
     }
     
@@ -941,7 +954,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         cfg = get_matdiff_config(ds_name)
         FIXED_EPOCHS = cfg["epochs"]
         
-        # Train 80% split (seed=42)
+        # Train 80% split (seed=42) — same as benchmark
         from sklearn.model_selection import train_test_split
         X_tr_80, _, y_tr_80, _ = train_test_split(
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
@@ -949,60 +962,51 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         
         print(f"\n  [TRAINING PHASE - Train each variant once on {len(X_tr_80)} samples]")
         
-        # Train all variants ONCE
-        trained_pipelines = {}
+        # Train all variants ONCE and store their synthetic samples
+        trained_samples = {}  # variant_name -> (X_syn, y_syn)
+        
         for variant_name in ABLATION_VARIANTS:
             if variant_name == "IDENTITY":
                 continue
             
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
             
-            # Configure variant — each ablation changes exactly ONE component
+            # Configure variant — each ablation changes EXACTLY ONE component properly
             use_fisher_weights = True
+            use_geodesic = True
+            n_blocks = cfg["n_blocks"]
+            n_phases = cfg["n_phases"]
+            
             if variant_name == "w/o Fisher":
-                # Same architecture and LR; only disable Fisher loss weighting
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
                 use_fisher_weights = False
                 
             elif variant_name == "w/o Geodesic":
-                # n_blocks=1 removes geodesic attention blocks; keep n_phases
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = 1, cfg["n_phases"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
+                use_geodesic = False  # Use StandardAttentionBlock instead
                 
             elif variant_name == "w/o Spectral":
-                # n_phases=1 removes spectral curriculum; keep n_blocks
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = cfg["n_blocks"], 1
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
-                
-            else:  # MAT-Diff (Ours)
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
+                n_phases = 1  # Falls back to linear schedule + uniform sampling
             
             # Train
             try:
                 pipeline = MATDiffPipeline(
-                    device=device, d_model=d_model, d_hidden=d_hidden,
-                    n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
-                    total_timesteps=total_timesteps, dropout=0.1, lr=lr,
+                    device=device, d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
+                    n_blocks=n_blocks, n_heads=cfg["n_heads"], n_phases=n_phases,
+                    total_timesteps=cfg["total_timesteps"], dropout=cfg.get("dropout", 0.1),
+                    lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-5),
                 )
                 pipeline.use_fisher_weights = use_fisher_weights
-                pipeline.fit(X_tr_80, y_tr_80, epochs=epochs,
+                pipeline.use_geodesic = use_geodesic
+                pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
                             batch_size=cfg["batch_size"], verbose=False)
-                trained_pipelines[variant_name] = pipeline
+                
+                # Sample ONCE and store
+                X_syn_raw, y_syn_raw = pipeline.sample()
+                trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
                 print("✓")
             except Exception as e:
                 print(f"FAILED: {str(e)[:50]}")
         
-        # Evaluate all variants on 10 splits
+        # Evaluate all variants on n_seeds splits
         print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
         
         variant_results = {var: {'F1': [], 'Acc': [], 'MCC': []} for var in ABLATION_VARIANTS}
@@ -1014,25 +1018,26 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
             )
             
+            cc = Counter(y_tr)
+            majority_count = max(cc.values())
+            minority_label = min(cc, key=cc.get)
+            needed = majority_count - cc[minority_label]
+            
             for variant_name in ABLATION_VARIANTS:
                 if variant_name == "IDENTITY":
                     X_aug, y_aug = X_tr, y_tr
-                elif variant_name in trained_pipelines:
-                    try:
-                        pipeline = trained_pipelines[variant_name]
-                        X_syn_raw, y_syn_raw = pipeline.sample()
-                        
-                        cc = Counter(y_tr)
-                        minority_label = min(cc, key=cc.get)
-                        needed = max(cc.values()) - cc[minority_label]
-                        
-                        mask = (y_syn_raw == minority_label)
-                        X_syn = X_syn_raw[mask][:needed]
-                        y_syn = np.full(len(X_syn), minority_label)
-                        
+                elif variant_name in trained_samples:
+                    X_syn_raw, y_syn_raw = trained_samples[variant_name]
+                    
+                    # Use same augmentation logic as benchmark
+                    mask = (y_syn_raw == minority_label)
+                    X_syn = X_syn_raw[mask][:needed]
+                    y_syn = np.full(len(X_syn), minority_label)
+                    
+                    if len(X_syn) > 0:
                         X_aug = np.vstack([X_tr, X_syn])
                         y_aug = np.hstack([y_tr, y_syn])
-                    except Exception:
+                    else:
                         X_aug, y_aug = X_tr, y_tr
                 else:
                     X_aug, y_aug = X_tr, y_tr
@@ -1153,6 +1158,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
