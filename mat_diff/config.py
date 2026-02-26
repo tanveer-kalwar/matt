@@ -143,10 +143,12 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     elif spf < 30:
         d_model = max(64, min(d_model, 128))
 
-    # n_blocks: reduce to 1 for small or sample-starved datasets
+    # n_blocks: more blocks = more geodesic attention layers = better geometry capture
     if n_samples < 500 or spf < 10:
-        n_blocks = 1
+        n_blocks = 2
     elif n_features > 50:
+        n_blocks = 4
+    elif n_features > 20:
         n_blocks = 3
     else:
         n_blocks = 2
@@ -158,12 +160,15 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batch_size = min(512, max(64, n_samples // 6))
     batch_size = 2 ** round(math.log2(batch_size))
 
-    # epochs: 200 for small datasets, 300 otherwise
-    epochs = 200 if n_samples < 500 else 300
+    # epochs: scale with IR — harder problems need more training
+    base_epochs = 300
+    ir_bonus = int(50 * math.log2(max(ir, 1)))
+    epochs = min(800, base_epochs + ir_bonus)
+    if n_samples < 500:
+        epochs = min(epochs, 400)
 
-    # d_hidden: 4× d_model (standard transformer ratio)
+    # d_hidden: 4x d_model (standard transformer ratio)
     d_hidden = d_model * 4
-    d_hidden = min(d_hidden, 1024)
 
     # n_phases: Only use multiple phases if enough features to partition
     # and enough samples per feature for the split to be meaningful
@@ -178,6 +183,9 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     dropout = 0.15 if spf < 20 else 0.1
     weight_decay = 1e-4 if spf < 20 else 1e-5
 
+    # Sampling steps: fewer steps with DDIM for speed + quality
+    sampling_steps = 200
+
     return {
         "d_model": d_model,
         "d_hidden": d_hidden,
@@ -188,6 +196,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "lr": 4e-4,
         "dropout": dropout,
         "total_timesteps": 1000,
+        "sampling_steps": sampling_steps,
         "n_phases": n_phases,
         "weight_decay": weight_decay,
         "n_seeds": 10,
@@ -210,6 +219,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
