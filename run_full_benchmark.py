@@ -680,7 +680,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         if "MAT-Diff" in ALL_METHODS:
             print(f"    [MAT-Diff] Training...")
             try:
-                    matdiff_pipeline = MATDiffPipeline(
+                matdiff_pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
                     n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
@@ -1157,6 +1157,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
