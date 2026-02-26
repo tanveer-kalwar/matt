@@ -690,8 +690,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     weight_decay=cfg.get("weight_decay", 1e-5),
                 )
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
-                                     batch_size=cfg["batch_size"], verbose=False)
-                
+                           batch_size=cfg["batch_size"], verbose=False)
                 # Generate large pool of samples
                 X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
                 matdiff_samples = (X_syn_raw, y_syn_raw)
@@ -1158,6 +1157,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
