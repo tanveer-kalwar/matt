@@ -104,6 +104,7 @@ class MATDiffDenoiser(nn.Module):
         dropout: float = 0.1,
         dim_t: int = 128,
         use_curvature: bool = True,
+        use_geodesic: bool = True,
         init_fim: Optional[torch.Tensor] = None,
     ):
         super().__init__()
@@ -158,13 +159,16 @@ class MATDiffDenoiser(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Core blocks: GeodesicAttention + conditioned MLP
+        # Core blocks: Attention + conditioned MLP
         self.attn_blocks = nn.ModuleList()
         self.mlp_blocks = nn.ModuleList()
         self.attn_adalns = nn.ModuleList()
+        
+        AttentionClass = GeodesicAttentionBlock if use_geodesic else StandardAttentionBlock
+        
         for _ in range(n_blocks):
             self.attn_blocks.append(
-                GeodesicAttentionBlock(
+                AttentionClass(
                     d_model=d_model,
                     n_heads=n_heads,
                     dropout=dropout,
@@ -220,5 +224,6 @@ class MATDiffDenoiser(nn.Module):
         # Output
         h = self.output_norm(h, cond)
         return self.output_proj(h)
+
 
 
