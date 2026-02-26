@@ -128,13 +128,28 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
 
     No manual tuning. Every value follows a documented rule.
     All hyperparameters scale with dataset properties for generalization.
+    Model capacity is bounded by available data (samples-per-feature ratio).
     """
-    # d_model: Scale with features, minimum 128 for meaningful attention
+    # samples-per-feature ratio: governs model capacity vs data availability
+    spf = n_samples / max(n_features, 1)
+
+    # d_model: Scale with features, minimum 64 for meaningful attention
     base_d = max(128, 4 * n_features)
     d_model = min(256, 2 ** math.ceil(math.log2(base_d)))
 
-    # n_blocks: 2 for most datasets, 3 only for very high-dimensional
-    n_blocks = 3 if n_features > 50 else 2
+    # Reduce capacity when sample-starved to prevent overfitting
+    if spf < 10:
+        d_model = max(64, d_model // 2)
+    elif spf < 30:
+        d_model = max(64, min(d_model, 128))
+
+    # n_blocks: reduce to 1 for small or sample-starved datasets
+    if n_samples < 500 or spf < 10:
+        n_blocks = 1
+    elif n_features > 50:
+        n_blocks = 3
+    else:
+        n_blocks = 2
 
     # n_heads: Each head handles ~64 dimensions, minimum 2
     n_heads = max(2, d_model // 64)
@@ -143,21 +158,25 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batch_size = min(512, max(64, n_samples // 6))
     batch_size = 2 ** round(math.log2(batch_size))
 
-    # epochs: 300 base, no IR scaling (prevents overfitting)
-    epochs = 300
+    # epochs: 200 for small datasets, 300 otherwise
+    epochs = 200 if n_samples < 500 else 300
 
     # d_hidden: 4× d_model (standard transformer ratio)
     d_hidden = d_model * 4
     d_hidden = min(d_hidden, 1024)
 
     # n_phases: Only use multiple phases if enough features to partition
-    # For <20 features, spectral curriculum has too few dimensions to split
-    if n_features >= 30:
+    # and enough samples per feature for the split to be meaningful
+    if n_features >= 30 and spf >= 10:
         n_phases = 3
-    elif n_features >= 15:
+    elif n_features >= 15 and spf >= 10:
         n_phases = 2
     else:
         n_phases = 1
+
+    # Regularisation: increase for small/sample-starved datasets
+    dropout = 0.15 if spf < 20 else 0.1
+    weight_decay = 1e-4 if spf < 20 else 1e-5
 
     return {
         "d_model": d_model,
@@ -167,10 +186,10 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "batch_size": batch_size,
         "epochs": epochs,
         "lr": 4e-4,
-        "dropout": 0.1,
+        "dropout": dropout,
         "total_timesteps": 1000,
         "n_phases": n_phases,
-        "weight_decay": 1e-5,
+        "weight_decay": weight_decay,
         "n_seeds": 10,
     }
 

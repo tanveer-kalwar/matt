@@ -957,22 +957,27 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
             
-            # Configure variant
+            # Configure variant — each ablation changes exactly ONE component
+            use_fisher_weights = True
             if variant_name == "w/o Fisher":
+                # Same architecture and LR; only disable Fisher loss weighting
                 d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = 2, 1
-                lr, epochs = 2e-4, FIXED_EPOCHS
+                n_blocks, n_phases = cfg["n_blocks"], cfg["n_phases"]
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
                 total_timesteps = cfg["total_timesteps"]
+                use_fisher_weights = False
                 
             elif variant_name == "w/o Geodesic":
+                # n_blocks=1 removes geodesic attention blocks; keep n_phases
                 d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = 1, 1
+                n_blocks, n_phases = 1, cfg["n_phases"]
                 lr, epochs = cfg["lr"], FIXED_EPOCHS
                 total_timesteps = cfg["total_timesteps"]
                 
             elif variant_name == "w/o Spectral":
+                # n_phases=1 removes spectral curriculum; keep n_blocks
                 d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks, n_phases = 2, 1
+                n_blocks, n_phases = cfg["n_blocks"], 1
                 lr, epochs = cfg["lr"], FIXED_EPOCHS
                 total_timesteps = cfg["total_timesteps"]
                 
@@ -989,6 +994,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                     n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
                     total_timesteps=total_timesteps, dropout=0.1, lr=lr,
                 )
+                pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.fit(X_tr_80, y_tr_80, epochs=epochs,
                             batch_size=cfg["batch_size"], verbose=False)
                 trained_pipelines[variant_name] = pipeline

@@ -62,7 +62,16 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
 
     elif rule.startswith("eq_"):
         val = rule[3:]
-        return (y_str == val).astype(int)
+        binary = (y_str == val).astype(int)
+        # If string match yields no positives, try numeric comparison
+        if binary.sum() == 0:
+            try:
+                num_val = float(val)
+                y_num = pd.to_numeric(pd.Series(y_str), errors="coerce")
+                binary = (y_num == num_val).fillna(False).astype(int).values
+            except ValueError:
+                pass
+        return binary
 
     elif rule.startswith("le_"):
         threshold = int(rule[3:])
@@ -138,6 +147,18 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
         le = LabelEncoder()
         y = le.fit_transform(np.array([str(v).strip() for v in y_raw]))
 
+    # Validate that at least 2 classes with sufficient samples exist
+    unique, counts = np.unique(y, return_counts=True)
+    if len(unique) < 2 or counts.min() < 2:
+        # Fall back to majority vs. rest binarization
+        y = _apply_minority_rule(y_raw, "minority")
+        unique, counts = np.unique(y, return_counts=True)
+        if len(unique) < 2 or counts.min() < 2:
+            raise ValueError(
+                f"Dataset {dataset_name}: only {len(unique)} class(es) found after "
+                f"binarization — cannot form a valid train/test split."
+            )
+
     # Encode features
     numeric_cols = X_df.select_dtypes(include=np.number).columns.tolist()
     cat_cols = X_df.select_dtypes(exclude=np.number).columns.tolist()
@@ -154,9 +175,16 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     else:
         raise ValueError(f"No features found in {dataset_name}")
 
-    # Stratified split
+    # Stratified split — fall back to random split if a class is too small
+    unique_y, counts_y = np.unique(y, return_counts=True)
+    min_count = counts_y.min()
+    n_test = max(1, int(len(y) * 0.2))
+    min_samples_per_class_for_stratify = max(2, int(np.ceil(n_test / len(unique_y))))
+    has_minimum_samples = min_count >= 2
+    can_stratify_split = min_count >= min_samples_per_class_for_stratify
+    use_stratify = has_minimum_samples and can_stratify_split
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=y
+        X, y, test_size=0.2, random_state=seed, stratify=y if use_stratify else None
     )
 
     # QuantileTransformer: maps to [0,1] — robust to outliers
