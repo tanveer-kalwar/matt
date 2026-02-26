@@ -78,12 +78,11 @@ class FisherInformationEstimator:
         """Per-class loss weights: inverse-frequency × curvature modulation.
 
         Base weight = n_total / (n_classes * n_c)  [standard inverse frequency]
-        Curvature modulation = (curv_c / mean_curv) ^ 0.25  [gentle curvature scaling]
+        Curvature modulation = (curv_c / mean_curv) ^ 0.5  [stronger curvature scaling]
         Final weight = base * modulation, normalized so mean = 1.0
 
-        The 0.25 exponent provides a gentle curvature adjustment without
-        overwhelming the inverse-frequency signal. This follows the principle
-        of effective number of samples (Cui et al., CVPR 2019).
+        The 0.5 exponent provides meaningful curvature adjustment that actually
+        differentiates between geometrically simple and complex classes.
         """
         if not self._class_counts:
             return {c: 1.0 for c in self.curvatures}
@@ -96,14 +95,14 @@ class FisherInformationEstimator:
         for c, n_c in self._class_counts.items():
             base_weights[c] = n_total / (n_cls * max(n_c, 1))
 
-        # Curvature modulation (gentle)
+        # Curvature modulation (meaningful strength)
         mean_curv = np.mean(list(self.curvatures.values())) if self.curvatures else 1.0
         mean_curv = max(mean_curv, 1e-12)
 
         raw_weights = {}
         for c in self._class_counts:
             curv_ratio = self.curvatures.get(c, mean_curv) / mean_curv
-            modulation = curv_ratio ** 0.25  # gentle curvature scaling
+            modulation = curv_ratio ** 0.5  # stronger than 0.25, weaker than linear
             raw_weights[c] = base_weights[c] * modulation
 
         # Normalize: mean weight = 1.0
@@ -146,3 +145,4 @@ class FisherInformationEstimator:
         for c, v in self.curvatures.items():
             curv[c] = v
         return curv
+
