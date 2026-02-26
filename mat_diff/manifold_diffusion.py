@@ -124,7 +124,8 @@ class MATDiffPipeline:
         self.fisher.fit(X_tr, y_tr)
 
         loss_weights = self.fisher.get_loss_weights()
-        if not self.use_fisher_weights:
+        # Allow disabling Fisher weights for ablation
+        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             loss_weights = {c: 1.0 for c in loss_weights}
         curvature_tensor = self.fisher.get_curvature_tensor(self.device)
 
@@ -499,3 +500,4 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
