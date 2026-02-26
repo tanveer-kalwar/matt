@@ -50,6 +50,7 @@ class MATDiffPipeline:
         self.lr = lr
         self.weight_decay = weight_decay
         self.privacy_quantile = privacy_quantile
+        self.use_fisher_weights = True
 
         self.fisher: Optional[FisherInformationEstimator] = None
         self.scheduler: Optional[SpectralCurriculumScheduler] = None
@@ -123,6 +124,8 @@ class MATDiffPipeline:
         self.fisher.fit(X_tr, y_tr)
 
         loss_weights = self.fisher.get_loss_weights()
+        if not self.use_fisher_weights:
+            loss_weights = {c: 1.0 for c in loss_weights}
         curvature_tensor = self.fisher.get_curvature_tensor(self.device)
 
         if verbose:
@@ -226,8 +229,9 @@ class MATDiffPipeline:
         self.denoiser.train()
 
         # Balanced sampling: each class sampled to max_class_size (1×, not 2×)
+        unique_labels = torch.unique(y_tensor).tolist()
         class_indices = {}
-        for c in range(self.n_classes):
+        for c in unique_labels:
             class_indices[c] = torch.where(y_tensor == c)[0]
         max_class_size = max(len(v) for v in class_indices.values())
 
@@ -238,7 +242,7 @@ class MATDiffPipeline:
         for epoch in range(epochs):
             # Balanced batch: sample each class up to max_class_size
             balanced_idx = []
-            for c in range(self.n_classes):
+            for c in class_indices:
                 cidx = class_indices[c]
                 if len(cidx) == 0:
                     continue
