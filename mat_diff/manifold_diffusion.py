@@ -231,9 +231,10 @@ class MATDiffPipeline:
 
         # Balanced sampling: each class sampled to max_class_size (1×, not 2×)
         unique_labels = torch.unique(y_tensor).tolist()
+        unique_labels = torch.unique(y_tensor).tolist()
         class_indices = {}
         for c in unique_labels:
-            class_indices[c] = torch.where(y_tensor == c)[0]
+            class_indices[int(c)] = torch.where(y_tensor == c)[0]
         max_class_size = max(len(v) for v in class_indices.values())
 
         best_loss = float('inf')
@@ -243,8 +244,8 @@ class MATDiffPipeline:
         for epoch in range(epochs):
             # Balanced batch: sample each class up to max_class_size
             balanced_idx = []
-            for c in class_indices:
-                cidx = class_indices[c]
+            for c in unique_labels:
+                cidx = class_indices[int(c)]
                 if len(cidx) == 0:
                     continue
                 sampled = cidx[torch.randint(0, len(cidx), (max_class_size,), device=self.device)]
@@ -500,4 +501,5 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
