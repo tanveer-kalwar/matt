@@ -148,23 +148,28 @@ class SpectralCurriculumScheduler:
         t_high = max(t_low + 1, min(t_high, self.total_timesteps))
         return (t_low, t_high)
 
-
     def sample_timesteps(
         self, batch_size: int, epoch: int, total_epochs: int, device: str = "cpu"
         ) -> torch.Tensor:
-            """Sample timesteps uniformly from the full range.
+            """Sample timesteps with curriculum bias toward current phase.
 
-            The curriculum is encoded in the beta schedule itself (computed
-            from spectral energy). Additional timestep biasing causes
-            under-training on mid-range timesteps and hurts sample quality.
+            70% of timesteps drawn from the current phase range (curriculum),
+            30% drawn uniformly from the full range (ensures all timesteps
+            are trained throughout, preventing dead zones during sampling).
             """
             t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
             t_low = max(0, t_low)
             t_high = max(t_low + 1, t_high)
 
-            # Uniform sampling within the phase range (no bias)
-            t = torch.randint(t_low, t_high, (batch_size,), device=device)
+            n_phase = int(batch_size * 0.7)
+            n_full = batch_size - n_phase
+
+            t_phase = torch.randint(t_low, t_high, (n_phase,), device=device)
+            t_full = torch.randint(0, self.total_timesteps, (n_full,), device=device)
+            t = torch.cat([t_phase, t_full])
+            t = t[torch.randperm(len(t), device=device)]
             return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
