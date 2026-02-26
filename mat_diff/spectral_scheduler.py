@@ -156,7 +156,14 @@ class SpectralCurriculumScheduler:
             70% of timesteps drawn from the current phase range (curriculum),
             30% drawn uniformly from the full range (ensures all timesteps
             are trained throughout, preventing dead zones during sampling).
+            
+            If n_phases == 1, ALL timesteps are drawn uniformly (no curriculum).
             """
+            if self.n_phases <= 1:
+                # No curriculum — uniform sampling (proper ablation)
+                return torch.randint(0, self.total_timesteps, (batch_size,), 
+                                     device=device).long()
+            
             t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
             t_low = max(0, t_low)
             t_high = max(t_low + 1, t_high)
@@ -169,6 +176,7 @@ class SpectralCurriculumScheduler:
             t = torch.cat([t_phase, t_full])
             t = t[torch.randperm(len(t), device=device)]
             return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
