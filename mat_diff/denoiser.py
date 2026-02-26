@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .geodesic_attention import GeodesicAttentionBlock
+from .geodesic_attention import GeodesicAttentionBlock, StandardAttentionBlock
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -220,4 +220,5 @@ class MATDiffDenoiser(nn.Module):
         # Output
         h = self.output_norm(h, cond)
         return self.output_proj(h)
+
 
