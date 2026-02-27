@@ -1027,7 +1027,9 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         # Evaluate all variants on n_seeds splits
         print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
         
-        variant_results = {var: {'F1': [], 'Acc': [], 'MCC': []} for var in ABLATION_VARIANTS}
+        variant_results = {var: {'F1': [], 'Acc': [], 'MCC': [],
+                                 'F1_per_clf': {cn: [] for cn in CLF_NAMES}}
+                           for var in ABLATION_VARIANTS}
         
         for seed in range(n_seeds):
             print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
@@ -1070,14 +1072,17 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 variant_results[variant_name]['F1'].append(f1_avg)
                 variant_results[variant_name]['Acc'].append(acc_avg)
                 variant_results[variant_name]['MCC'].append(mcc_avg)
+                for cn in CLF_NAMES:
+                    variant_results[variant_name]['F1_per_clf'][cn].append(clf_results[cn]["F1"])
             
-            # Print F1 for this seed
-            f1_vals = [f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}" 
-                      for var in ABLATION_VARIANTS]
-            print(" | ".join(f1_vals))
+            # Print per-classifier F1 for this seed (matching DGOT protocol)
+            seed_summary = []
+            for var in ABLATION_VARIANTS:
+                seed_summary.append(f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}")
+            print(" | ".join(seed_summary))
         
         # Aggregate results
-        print(f"\n  [Dataset Summary]")
+        print(f"\n  [Dataset Summary — Average across 5 classifiers]")
         for variant_name in ABLATION_VARIANTS:
             f1_mean = np.mean(variant_results[variant_name]['F1'])
             f1_std = np.std(variant_results[variant_name]['F1'])
@@ -1087,6 +1092,16 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             mcc_std = np.std(variant_results[variant_name]['MCC'])
             
             print(f"    {variant_name:<20s} F1: {f1_mean:.4f} ± {f1_std:.4f}  Acc: {acc_mean:.4f} ± {acc_std:.4f}  MCC: {mcc_mean:.4f} ± {mcc_std:.4f}")
+        
+        print(f"\n  [Per-Classifier F1 — This is what DGOT/GOIO papers report]")
+        print(f"    {'Variant':<20s} {'XGB':>8s} {'DTC':>8s} {'Logit':>8s} {'RFC':>8s} {'KNN':>8s}")
+        print(f"    {'─'*20} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+        for variant_name in ABLATION_VARIANTS:
+            clf_f1s = []
+            for cn in CLF_NAMES:
+                vals = variant_results[variant_name]['F1_per_clf'][cn]
+                clf_f1s.append(np.mean(vals) if vals else 0.0)
+            print(f"    {variant_name:<20s} {clf_f1s[0]:>8.4f} {clf_f1s[1]:>8.4f} {clf_f1s[2]:>8.4f} {clf_f1s[3]:>8.4f} {clf_f1s[4]:>8.4f}")
             
             all_results.append({
                 "Dataset": ds_name, "Variant": variant_name,
@@ -1176,6 +1191,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
