@@ -390,7 +390,7 @@ class MATDiffPipeline:
         else:
             return mean
 
-        @torch.no_grad()
+    @torch.no_grad()
     def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, guidance_scale=1.5):
         """DDIM deterministic sampling step."""
         B = x_t.shape[0]
@@ -578,6 +578,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
