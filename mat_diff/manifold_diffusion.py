@@ -283,23 +283,8 @@ class MATDiffPipeline:
                 noise = torch.randn_like(x_batch)
                 x_noisy = self._q_sample(x_batch, t, noise)
 
-                # Self-conditioning: 50% of the time, use model's own x0 estimate
-                x_self_cond = torch.zeros_like(x_batch)
-                if torch.rand(1).item() > 0.5:
-                    with torch.no_grad():
-                        noise_pred_sc = self.denoiser(
-                            x_noisy, t, y=y_batch, curvature=curv_batch
-                        )
-                        t_clamped = torch.clamp(t, 0, self.total_timesteps - 1)
-                        sqrt_alpha = self.sqrt_alphas_cumprod[t_clamped].view(-1, 1)
-                        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t_clamped].view(-1, 1)
-                        x_self_cond = ((x_noisy - sqrt_one_minus * noise_pred_sc) / (sqrt_alpha + 1e-8)).detach()
-                        x_self_cond = torch.clamp(x_self_cond, 0.0, 1.0)
-
-                x_input = x_noisy + x_self_cond * 0.1
-
                 noise_pred = self.denoiser(
-                    x_input, t, y=y_batch, curvature=curv_batch
+                    x_noisy, t, y=y_batch, curvature=curv_batch
                 )
 
                 loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
@@ -393,16 +378,7 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Self-conditioned prediction
-        with torch.no_grad():
-            noise_pred_init = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-            t_clamped = max(0, min(t_idx, self.total_timesteps - 1))
-            alpha_t = self.alphas_cumprod[t_clamped]
-            x0_est = (x_t - torch.sqrt(1 - alpha_t) * noise_pred_init) / (torch.sqrt(alpha_t) + 1e-8)
-            x0_est = torch.clamp(x0_est, 0.0, 1.0)
-        
-        x_input = x_t + x0_est * 0.1
-        noise_pred = self.denoiser(x_input, t_tensor, y=y, curvature=curvature)
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -425,17 +401,7 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Self-conditioned prediction
-        with torch.no_grad():
-            noise_pred_init = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-            # Estimate x_0
-            alpha_t = self.alphas_cumprod[t_idx]
-            x0_est = (x_t - torch.sqrt(1 - alpha_t) * noise_pred_init) / (torch.sqrt(alpha_t) + 1e-8)
-            x0_est = torch.clamp(x0_est, 0.0, 1.0)
-        
-        # Second pass with self-conditioning
-        x_input = x_t + x0_est * 0.1
-        noise_pred = self.denoiser(x_input, t_tensor, y=y, curvature=curvature)
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
         # DDIM update
         alpha_t = self.alphas_cumprod[t_idx]
@@ -464,19 +430,14 @@ class MATDiffPipeline:
         if n_per_class is None:
             class_counts = dict(zip(*np.unique(self.y_train, return_counts=True)))
             majority_count = max(class_counts.values())
-            n_per_class = {
-                int(c): max(0, int(majority_count - cnt))
-                for c, cnt in class_counts.items()
-            }
-            if self.fisher is not None:
-                total_deficit = sum(n_per_class.values())
-                alloc = self.fisher.get_augmentation_allocation(
-                    total_deficit, {int(k): int(v) for k, v in class_counts.items()}
-                )
-                for c in n_per_class:
-                    if c in alloc:
-                        deficit = int(majority_count - class_counts.get(c, 0))
-                        n_per_class[c] = max(alloc[c], deficit)
+            n_per_class = {}
+            for c, cnt in class_counts.items():
+                deficit = max(0, int(majority_count - cnt))
+                if deficit > 0:
+                    # Generate enough to fully balance
+                    n_per_class[int(c)] = deficit
+                else:
+                    n_per_class[int(c)] = 0
 
         sampling_steps = getattr(self, '_sampling_steps', 200)
         step_size = max(1, self.total_timesteps // sampling_steps)
@@ -552,7 +513,62 @@ class MATDiffPipeline:
         if not all_X:
             return np.empty((0, self.n_features)), np.empty(0, dtype=int)
 
-        return np.vstack(all_X), np.concatenate(all_y)
+        X_all_syn = np.vstack(all_X)
+        y_all_syn = np.concatenate(all_y)
+        
+        # Quality filtering: reject synthetic samples that are
+        # (a) too far from real minority (outliers/noise) or
+        # (b) too close to real minority (memorized copies)
+        if self.X_train is not None and len(X_all_syn) > 0:
+            from sklearn.neighbors import NearestNeighbors
+            X_filtered_parts, y_filtered_parts = [], []
+            
+            for c_label in np.unique(y_all_syn):
+                c_label = int(c_label)
+                X_syn_c = X_all_syn[y_all_syn == c_label]
+                X_real_c = self.X_train[self.y_train == c_label]
+                
+                if len(X_real_c) < 2 or len(X_syn_c) < 2:
+                    X_filtered_parts.append(X_syn_c)
+                    y_filtered_parts.append(np.full(len(X_syn_c), c_label))
+                    continue
+                
+                # Compute distance from each synthetic to nearest real
+                nn = NearestNeighbors(n_neighbors=1, algorithm='auto')
+                nn.fit(X_real_c)
+                dists, _ = nn.kneighbors(X_syn_c)
+                dists = dists.ravel()
+                
+                # Also compute typical real-to-real distance for reference
+                nn_real = NearestNeighbors(n_neighbors=2, algorithm='auto')
+                nn_real.fit(X_real_c)
+                real_dists, _ = nn_real.kneighbors(X_real_c)
+                typical_dist = np.median(real_dists[:, 1])  # exclude self
+                
+                # Keep samples within [0.1 * typical, 5 * typical] distance
+                # Too close = memorization, too far = noise
+                min_dist = typical_dist * 0.1
+                max_dist = typical_dist * 5.0
+                
+                quality_mask = (dists >= min_dist) & (dists <= max_dist)
+                X_good = X_syn_c[quality_mask]
+                
+                # If filtering removed too many, relax and take top-k by distance
+                needed = len(X_syn_c)
+                if len(X_good) < needed * 0.5:
+                    # Sort by distance, take those closest to typical_dist
+                    dist_from_typical = np.abs(dists - typical_dist)
+                    best_idx = np.argsort(dist_from_typical)[:needed]
+                    X_good = X_syn_c[best_idx]
+                
+                X_filtered_parts.append(X_good)
+                y_filtered_parts.append(np.full(len(X_good), c_label))
+            
+            if X_filtered_parts:
+                X_all_syn = np.vstack(X_filtered_parts)
+                y_all_syn = np.concatenate(y_filtered_parts)
+        
+        return X_all_syn, y_all_syn
 
     def save(self, path: str):
         import os
@@ -607,6 +623,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
