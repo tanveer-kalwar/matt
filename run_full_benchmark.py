@@ -977,21 +977,40 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             n_phases = cfg["n_phases"]
             
             if variant_name == "w/o Fisher":
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
                 use_fisher_weights = False
                 
             elif variant_name == "w/o Geodesic":
-                use_geodesic = False  # Use StandardAttentionBlock instead
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks = cfg["n_blocks"]
+                n_phases = cfg["n_phases"]
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+                use_geodesic = False
                 
             elif variant_name == "w/o Spectral":
-                n_phases = 1  # Falls back to linear schedule + uniform sampling
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks = cfg["n_blocks"]
+                n_phases = 1
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
+                
+            else:  # MAT-Diff (Ours)
+                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
+                n_blocks = cfg["n_blocks"]
+                n_phases = cfg["n_phases"]
+                lr, epochs = cfg["lr"], FIXED_EPOCHS
+                total_timesteps = cfg["total_timesteps"]
             
             # Train
             try:
                 pipeline = MATDiffPipeline(
-                    device=device, d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-                    n_blocks=n_blocks, n_heads=cfg["n_heads"], n_phases=n_phases,
-                    total_timesteps=cfg["total_timesteps"], dropout=cfg.get("dropout", 0.1),
-                    lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-5),
+                    device=device, d_model=d_model, d_hidden=d_hidden,
+                    n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
+                    total_timesteps=total_timesteps, dropout=cfg.get("dropout", 0.1), lr=lr,
+                    weight_decay=cfg.get("weight_decay", 1e-5),
                 )
                 pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.use_geodesic = use_geodesic
@@ -1157,6 +1176,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
