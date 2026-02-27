@@ -160,12 +160,10 @@ class MATDiffDenoiser(nn.Module):
         )
 
         # Core blocks: Attention + conditioned MLP
+        AttentionClass = GeodesicAttentionBlock if use_geodesic else StandardAttentionBlock
         self.attn_blocks = nn.ModuleList()
         self.mlp_blocks = nn.ModuleList()
         self.attn_adalns = nn.ModuleList()
-        
-        AttentionClass = GeodesicAttentionBlock if use_geodesic else StandardAttentionBlock
-        
         for _ in range(n_blocks):
             self.attn_blocks.append(
                 AttentionClass(
@@ -224,6 +222,7 @@ class MATDiffDenoiser(nn.Module):
         # Output
         h = self.output_norm(h, cond)
         return self.output_proj(h)
+
 
 
 
