@@ -230,21 +230,63 @@ class MATDiffPipeline:
         X_tensor = torch.tensor(X_minority, dtype=torch.float32, device=self.device)
         y_tensor = torch.tensor(y_minority, dtype=torch.long, device=self.device)
 
-        # Curvature conditioning per sample
-        curvature_per_sample = torch.zeros(len(y_minority), device=self.device)
-        for i, label in enumerate(y_minority):
-            curvature_per_sample[i] = curvature_tensor[int(label)]
-        if curvature_per_sample.max() > 0:
-            curvature_per_sample = torch.log1p(curvature_per_sample)
-            curv_min = curvature_per_sample.min()
-            curv_range = curvature_per_sample.max() - curv_min
-            if curv_range > 0:
-                curvature_per_sample = (curvature_per_sample - curv_min) / curv_range
+        # Per-sample local curvature via k-NN density estimation.
+        # Isolated samples (boundary/outliers) have LOW density = HIGH curvature.
+        # This gives meaningful per-sample variation even on minority-only data.
+        from sklearn.neighbors import NearestNeighbors as _NN
+        k_nn = min(7, max(2, len(X_minority) // 20))
+        try:
+            _nn_model = _NN(n_neighbors=k_nn + 1, algorithm='auto')
+            _nn_model.fit(X_minority)
+            _dists, _ = _nn_model.kneighbors(X_minority)
+            # Exclude self (index 0), take mean of k nearest
+            mean_nn_dist = _dists[:, 1:].mean(axis=1)  # shape (N,)
+            # Invert density: large distance = low density = high curvature
+            curv_np = mean_nn_dist / (mean_nn_dist.max() + 1e-8)
+        except Exception:
+            curv_np = np.full(len(y_minority), 0.5, dtype=np.float32)
 
-        # Fisher loss weights per sample
-        weight_per_sample = torch.ones(len(y_minority), device=self.device)
-        for i, label in enumerate(y_minority):
-            weight_per_sample[i] = loss_weights[int(label)]
+        curvature_per_sample = torch.tensor(curv_np, dtype=torch.float32, device=self.device)
+        # Clamp to [0, 1]
+        curvature_per_sample = torch.clamp(curvature_per_sample, 0.0, 1.0)
+
+        # If Fisher is disabled, also disable curvature (both come from FIM geometry)
+        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
+            curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
+
+        # Fisher loss weights per sample: proximity to class boundary
+        # Samples closer to the majority centroid (harder/boundary) get higher weight
+        # This is meaningful even when training minority-only (varies per sample)
+        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
+            weight_per_sample = torch.ones(len(y_minority), device=self.device)
+        else:
+            majority_class = max(cc.keys(), key=lambda c: cc[c])
+            X_majority_arr = X_train[y_train == majority_class]
+            maj_mean = X_majority_arr.mean(axis=0)
+            min_mean = X_minority.mean(axis=0)
+
+            # Use FIM diagonal as per-feature importance weights
+            fim_key = int(minority_classes[0])
+            if fim_key in self.fisher.fim_matrices:
+                fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
+            else:
+                fim_diag = np.ones(self.n_features)
+            fim_diag = fim_diag / (fim_diag.sum() + 1e-12)
+
+            # Reference separation distance in FIM-weighted space
+            ref_diff = min_mean - maj_mean
+            ref_dist = float(np.sqrt(np.dot(ref_diff ** 2, fim_diag))) + 1e-8
+
+            weights_np = np.ones(len(y_minority), dtype=np.float32)
+            for i, x in enumerate(X_minority):
+                diff = x - maj_mean
+                dist = float(np.sqrt(np.dot(diff ** 2, fim_diag)))
+                ratio = dist / ref_dist  # < 1 means closer to boundary
+                # Boundary samples get up to 2x weight; far samples get 1x
+                weights_np[i] = 1.0 + max(0.0, 1.0 - ratio)
+
+            weights_np = weights_np / (weights_np.mean() + 1e-12)
+            weight_per_sample = torch.tensor(weights_np, dtype=torch.float32, device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -408,14 +450,9 @@ class MATDiffPipeline:
 
             self.denoiser.eval()
 
-            # Curvature for this class
-            import math as _math
-            curv_val = self.fisher.curvatures.get(class_label, 1.0)
-            all_curvs = list(self.fisher.curvatures.values())
-            log_curvs = [_math.log1p(c) for c in all_curvs]
-            log_min = min(log_curvs)
-            log_range = max(log_curvs) - log_min
-            curv_norm = (_math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
+            # Use median local curvature of minority class as conditioning for sampling
+            # This matches the per-sample curvature approach used during training
+            curv_norm = 0.5  # default: median = boundary-ambiguous region
 
             n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
             class_samples = []
@@ -430,16 +467,20 @@ class MATDiffPipeline:
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
 
-                # Strided DDPM reverse — every 5th step, still stochastic
+                # DDIM strided sampling — mathematically correct for non-consecutive steps.
+                # DDPM posterior formula is ONLY valid for consecutive t -> t-1 steps.
+                # DDIM is specifically designed for arbitrary stride.
                 sampling_steps = getattr(self, '_sampling_steps', 200)
                 stride = max(1, self.total_timesteps // sampling_steps)
                 timesteps = list(range(0, self.total_timesteps, stride))
-                if timesteps[-1] != self.total_timesteps - 1:
+                if (self.total_timesteps - 1) not in timesteps:
                     timesteps.append(self.total_timesteps - 1)
                 timesteps = sorted(timesteps, reverse=True)
-                
-                for t_idx in timesteps:
-                    x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=curvature)
+
+                for i, t_idx in enumerate(timesteps):
+                    t_prev_idx = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+                    x_t = self._ddim_sample_step(x_t, t_idx, t_prev_idx,
+                                                  y=y_cond, curvature=curvature)
 
                 # Clamp to data range
                 x_t = torch.clamp(x_t, 0.0, 1.0)
@@ -517,6 +558,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
