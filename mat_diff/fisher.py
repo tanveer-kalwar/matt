@@ -105,11 +105,18 @@ class FisherInformationEstimator:
             modulation = curv_ratio ** 0.5  # stronger than 0.25, weaker than linear
             raw_weights[c] = base_weights[c] * modulation
 
-        # Normalize: mean weight = 1.0
-        mean_w = np.mean(list(raw_weights.values()))
-        if mean_w < 1e-12:
+        # Normalize: majority weight = 1.0, minority weights scale UP
+        majority_class = max(self._class_counts, key=self._class_counts.get)
+        majority_w = raw_weights[majority_class]
+        if majority_w < 1e-12:
             return {c: 1.0 for c in self._class_counts}
-        return {c: w / mean_w for c, w in raw_weights.items()}
+        normalized = {c: w / majority_w for c, w in raw_weights.items()}
+        
+        # Cap at sqrt(IR) to prevent explosion for extreme imbalance
+        import math
+        max_ir = max(self._class_counts.values()) / max(1, min(self._class_counts.values()))
+        cap = math.sqrt(max_ir)
+        return {c: min(w, cap) for c, w in normalized.items()}
 
     def get_augmentation_allocation(
         self, total_budget: int, class_counts: Dict[int, int]
@@ -145,4 +152,5 @@ class FisherInformationEstimator:
         for c, v in self.curvatures.items():
             curv[c] = v
         return curv
+
 
