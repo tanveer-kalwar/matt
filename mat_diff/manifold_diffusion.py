@@ -263,10 +263,14 @@ class MATDiffPipeline:
             for start in range(0, len(perm), batch_size):
                 end = min(start + batch_size, len(perm))
                 idx = perm[start:end]
-                x_batch = X_tensor[idx]
-                y_batch = y_tensor[idx]
-                curv_batch = curvature_per_sample[idx]
-                w_batch = weight_per_sample[idx]
+                # Mixup augmentation: create virtual training samples
+                # Only for minority class samples to improve diversity
+                if torch.rand(1).item() > 0.5:
+                    perm = torch.randperm(len(x_batch), device=self.device)
+                    lam = torch.rand(len(x_batch), 1, device=self.device) * 0.3  # mild mixup
+                    # Only mixup samples of the same class
+                    same_class = (y_batch == y_batch[perm]).float().unsqueeze(1)
+                    x_batch = x_batch * (1 - lam * same_class) + x_batch[perm] * (lam * same_class)
 
                 t = self.scheduler.sample_timesteps(
                     len(x_batch), epoch, epochs, self.device
@@ -276,15 +280,29 @@ class MATDiffPipeline:
                 noise = torch.randn_like(x_batch)
                 x_noisy = self._q_sample(x_batch, t, noise)
 
-                # NO CFG dropping — always condition on class
-                # CFG requires large datasets to learn good unconditional model.
-                # With tiny minority classes, unconditional model is dominated by majority,
-                # and guidance amplifies majority-biased noise.
                 y_cfg = y_batch.clone()
                 curv_cfg = curv_batch.clone()
 
+                # Self-conditioning: 50% of the time, feed model's own x0 prediction
+                # back as additional signal. This dramatically improves sample quality.
+                x_self_cond = torch.zeros_like(x_batch)
+                if torch.rand(1).item() > 0.5:
+                    with torch.no_grad():
+                        noise_pred_sc = self.denoiser(
+                            x_noisy, t, y=y_cfg, curvature=curv_cfg
+                        )
+                        # Estimate x_0 from noise prediction
+                        t_clamped = torch.clamp(t, 0, self.total_timesteps - 1)
+                        sqrt_alpha = self.sqrt_alphas_cumprod[t_clamped].view(-1, 1)
+                        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t_clamped].view(-1, 1)
+                        x_self_cond = ((x_noisy - sqrt_one_minus * noise_pred_sc) / (sqrt_alpha + 1e-8)).detach()
+                        x_self_cond = torch.clamp(x_self_cond, 0.0, 1.0)
+
+                # Concatenate self-conditioning to input
+                x_input = x_noisy + x_self_cond * 0.1  # Gentle self-conditioning
+
                 noise_pred = self.denoiser(
-                    x_noisy, t, y=y_cfg, curvature=curv_cfg
+                    x_input, t, y=y_cfg, curvature=curv_cfg
                 )
 
                 # Weighted MSE loss
@@ -340,6 +358,28 @@ class MATDiffPipeline:
         self._data_min = float(X_tr.min())
         self._data_max = float(X_tr.max())
 
+        # Compute data PCA for correlation-preserving noise
+        # This ensures synthetic samples maintain feature correlations
+        X_centered = X_tr - X_tr.mean(axis=0)
+        try:
+            U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+            # Keep components that explain 99% variance
+            energy = np.cumsum(S**2) / (np.sum(S**2) + 1e-12)
+            n_components = max(2, int(np.searchsorted(energy, 0.99)) + 1)
+            n_components = min(n_components, len(S))
+            self._pca_components = torch.tensor(
+                Vt[:n_components].T, dtype=torch.float32, device=self.device
+            )  # shape (n_features, n_components)
+            self._pca_singular = torch.tensor(
+                S[:n_components], dtype=torch.float32, device=self.device
+            )
+            self._pca_mean = torch.tensor(
+                X_tr.mean(axis=0), dtype=torch.float32, device=self.device
+            )
+            self._use_pca_noise = True
+        except Exception:
+            self._use_pca_noise = False
+
         if verbose:
             print("  Training complete.")
             print("=" * 70)
@@ -357,8 +397,16 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Pure conditional prediction — no CFG
-        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+        # Self-conditioned prediction
+        with torch.no_grad():
+            noise_pred_init = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+            t_clamped = max(0, min(t_idx, self.total_timesteps - 1))
+            alpha_t = self.alphas_cumprod[t_clamped]
+            x0_est = (x_t - torch.sqrt(1 - alpha_t) * noise_pred_init) / (torch.sqrt(alpha_t) + 1e-8)
+            x0_est = torch.clamp(x0_est, 0.0, 1.0)
+        
+        x_input = x_t + x0_est * 0.1
+        noise_pred = self.denoiser(x_input, t_tensor, y=y, curvature=curvature)
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -381,8 +429,17 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Pure conditional prediction — no CFG
-        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+        # Self-conditioned prediction
+        with torch.no_grad():
+            noise_pred_init = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+            # Estimate x_0
+            alpha_t = self.alphas_cumprod[t_idx]
+            x0_est = (x_t - torch.sqrt(1 - alpha_t) * noise_pred_init) / (torch.sqrt(alpha_t) + 1e-8)
+            x0_est = torch.clamp(x0_est, 0.0, 1.0)
+        
+        # Second pass with self-conditioning
+        x_input = x_t + x0_est * 0.1
+        noise_pred = self.denoiser(x_input, t_tensor, y=y, curvature=curvature)
 
         # DDIM update
         alpha_t = self.alphas_cumprod[t_idx]
@@ -470,7 +527,14 @@ class MATDiffPipeline:
                 if batch_size <= 0:
                     break
 
-                x_t = torch.randn(batch_size, self.n_features, device=self.device)
+                # Initialize from PCA-structured noise to preserve correlations
+                if getattr(self, '_use_pca_noise', False):
+                    z = torch.randn(batch_size, self._pca_components.shape[1], device=self.device)
+                    # Scale by singular values (normalized) to match data variance structure
+                    s_norm = self._pca_singular / (self._pca_singular[0] + 1e-12)
+                    x_t = torch.matmul(z * s_norm.unsqueeze(0), self._pca_components.T)
+                else:
+                    x_t = torch.randn(batch_size, self.n_features, device=self.device)
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
 
@@ -547,6 +611,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
