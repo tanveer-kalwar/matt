@@ -130,18 +130,24 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     All hyperparameters scale with dataset properties for generalization.
     Model capacity is bounded by available data (samples-per-feature ratio).
     """
-    # samples-per-feature ratio: governs model capacity vs data availability
     spf = n_samples / max(n_features, 1)
 
-    # d_model: Scale with features, minimum 64 for meaningful attention
+    # d_model: Scale with features, minimum 64
     base_d = max(128, 4 * n_features)
     d_model = min(256, 2 ** math.ceil(math.log2(base_d)))
 
-    # Reduce capacity when sample-starved to prevent overfitting
+    # CRITICAL: minority-only training means model sees far fewer samples.
+    # Capacity MUST scale with minority count, not total dataset size.
+    minority_count = max(10, int(n_samples / max(ir, 2)))
+    if minority_count < 200:
+        d_model = 64
+    elif minority_count < 500:
+        d_model = max(64, min(128, d_model // 2))
+    elif minority_count < 1000:
+        d_model = max(64, min(192, d_model))
+
     if spf < 10:
         d_model = max(64, d_model // 2)
-    elif spf < 30:
-        d_model = max(64, min(d_model, 128))
 
     # n_blocks: more blocks = more geodesic attention layers = better geometry capture
     if n_samples < 500 or spf < 10:
@@ -220,6 +226,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
