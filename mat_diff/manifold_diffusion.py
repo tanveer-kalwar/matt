@@ -430,8 +430,15 @@ class MATDiffPipeline:
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
 
-                # Full DDPM reverse (stochastic — better diversity for small datasets)
-                for t_idx in reversed(range(self.total_timesteps)):
+                # Strided DDPM reverse — every 5th step, still stochastic
+                sampling_steps = getattr(self, '_sampling_steps', 200)
+                stride = max(1, self.total_timesteps // sampling_steps)
+                timesteps = list(range(0, self.total_timesteps, stride))
+                if timesteps[-1] != self.total_timesteps - 1:
+                    timesteps.append(self.total_timesteps - 1)
+                timesteps = sorted(timesteps, reverse=True)
+                
+                for t_idx in timesteps:
                     x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=curvature)
 
                 # Clamp to data range
@@ -510,6 +517,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
