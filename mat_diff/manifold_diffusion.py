@@ -98,12 +98,8 @@ class MATDiffPipeline:
 
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
-    def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
-        """Train with EMA and validation-based early stopping."""
-        from sklearn.model_selection import train_test_split
-
-        # Use ALL data for training (minority samples are too precious)
-        # Validation is done via training loss plateau detection
+        def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
+        """Train with focus on minority class quality."""
         self.X_train = X_train.copy()
         self.y_train = y_train.copy()
         X_tr = X_train
@@ -125,7 +121,6 @@ class MATDiffPipeline:
         self.fisher.fit(X_tr, y_tr)
 
         loss_weights = self.fisher.get_loss_weights()
-        # Allow disabling Fisher weights for ablation
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             loss_weights = {c: 1.0 for c in loss_weights}
         curvature_tensor = self.fisher.get_curvature_tensor(self.device)
@@ -156,7 +151,7 @@ class MATDiffPipeline:
 
         # ── Step 3: Build Denoiser ──
         if verbose:
-            print("\n[3/4] Building denoiser with Geodesic Attention...")
+            print("\n[3/4] Building denoiser...")
 
         avg_fim = np.mean(list(self.fisher.fim_matrices.values()), axis=0)
         init_fim_tensor = torch.tensor(
@@ -174,9 +169,11 @@ class MATDiffPipeline:
 
         dim_t = max(64, self.d_model // 2)
 
+        use_geodesic = getattr(self, 'use_geodesic', True)
+
         self.denoiser = MATDiffDenoiser(
             d_in=self.n_features,
-            num_classes=self.n_classes + 1,  # +1 for CFG null token
+            num_classes=self.n_classes + 1,
             d_model=self.d_model,
             d_hidden=self.d_hidden,
             n_blocks=self.n_blocks,
@@ -184,15 +181,16 @@ class MATDiffPipeline:
             dropout=self.dropout,
             dim_t=dim_t,
             use_curvature=True,
-            use_geodesic=self.use_geodesic,
+            use_geodesic=use_geodesic,
             init_fim=init_fim_tensor,
         ).to(self.device)
 
         if verbose:
             n_params = sum(p.numel() for p in self.denoiser.parameters())
             print(f"  Parameters: {n_params:,}")
+            print(f"  Geodesic Attention: {'ON' if use_geodesic else 'OFF (standard)'}")
 
-        # ── Step 4: Training Loop with EMA ──
+        # ── Step 4: Training Loop ──
         if verbose:
             print(f"\n[4/4] Training for {epochs} epochs...")
 
@@ -206,15 +204,15 @@ class MATDiffPipeline:
             optimizer, T_max=epochs, eta_min=self.lr * 0.01
         )
 
-        # EMA model for stable sampling
-        ema_decay = 0.999
+        # EMA for stable sampling
+        ema_decay = 0.9999
         ema_denoiser = copy.deepcopy(self.denoiser)
         ema_denoiser.eval()
 
         X_tensor = torch.tensor(X_tr, dtype=torch.float32, device=self.device)
         y_tensor = torch.tensor(y_tr, dtype=torch.long, device=self.device)
 
-        # Curvature per sample (for conditioning only, NOT for noise scaling)
+        # Compute per-sample curvature (for conditioning)
         curvature_per_sample = torch.zeros(len(y_tr), device=self.device)
         for i, label in enumerate(y_tr):
             curvature_per_sample[i] = curvature_tensor[int(label)]
@@ -231,26 +229,38 @@ class MATDiffPipeline:
 
         self.denoiser.train()
 
-        # Balanced sampling: each class sampled to max_class_size (1×, not 2×)
-        unique_labels = torch.unique(y_tensor).tolist()
+        # CRITICAL: Minority-focused balanced sampling
+        # Oversample minority classes MORE aggressively during training
         unique_labels = torch.unique(y_tensor).tolist()
         class_indices = {}
         for c in unique_labels:
             class_indices[int(c)] = torch.where(y_tensor == c)[0]
-        max_class_size = max(len(v) for v in class_indices.values())
+        
+        class_counts = {int(c): len(v) for c, v in class_indices.items()}
+        max_class_size = max(class_counts.values())
+        
+        # For training, minority classes are repeated to 2x majority
+        # This ensures the model sees more minority variation
+        minority_boost = 2
+        samples_per_class = {}
+        for c, count in class_counts.items():
+            if count < max_class_size:
+                samples_per_class[c] = max_class_size * minority_boost
+            else:
+                samples_per_class[c] = max_class_size
 
         best_loss = float('inf')
-        patience = 50
+        patience = 80
         patience_counter = 0
 
         for epoch in range(epochs):
-            # Balanced batch: sample each class up to max_class_size
             balanced_idx = []
             for c in unique_labels:
                 cidx = class_indices[int(c)]
                 if len(cidx) == 0:
                     continue
-                sampled = cidx[torch.randint(0, len(cidx), (max_class_size,), device=self.device)]
+                n_samples = samples_per_class[int(c)]
+                sampled = cidx[torch.randint(0, len(cidx), (n_samples,), device=self.device)]
                 balanced_idx.append(sampled)
             balanced_idx = torch.cat(balanced_idx)
             perm = balanced_idx[torch.randperm(len(balanced_idx), device=self.device)]
@@ -271,12 +281,13 @@ class MATDiffPipeline:
                 t = torch.clamp(t, 0, self.total_timesteps - 1)
 
                 noise = torch.randn_like(x_batch)
-                x_noisy = self._q_sample(x_batch, t, noise)  # Standard DDPM, no curvature
+                x_noisy = self._q_sample(x_batch, t, noise)
 
-                # Classifier-free guidance training: drop labels 15% of the time
-                drop_mask = torch.rand(len(x_batch), device=self.device) < 0.15
+                # CFG: drop labels 10% of the time (less aggressive for small datasets)
+                drop_rate = 0.10
+                drop_mask = torch.rand(len(x_batch), device=self.device) < drop_rate
                 y_cfg = y_batch.clone()
-                y_cfg[drop_mask] = self.n_classes  # null class token
+                y_cfg[drop_mask] = self.n_classes
                 curv_cfg = curv_batch.clone()
                 curv_cfg[drop_mask] = 0.0
 
@@ -284,6 +295,7 @@ class MATDiffPipeline:
                     x_noisy, t, y=y_cfg, curvature=curv_cfg
                 )
 
+                # Weighted MSE loss
                 loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
                 loss = (loss_per_sample * w_batch).mean()
 
@@ -306,7 +318,6 @@ class MATDiffPipeline:
             avg_loss = epoch_loss / max(1, n_batches)
             self.train_losses.append(avg_loss)
 
-            # Early stopping on training loss plateau
             if avg_loss < best_loss - 1e-5:
                 best_loss = avg_loss
                 patience_counter = 0
@@ -321,26 +332,28 @@ class MATDiffPipeline:
                     f"phase={phase}  lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
-            # Stop if no improvement for `patience` epochs (after warmup)
-            if patience_counter >= patience and epoch > epochs // 4:
+            if patience_counter >= patience and epoch > epochs // 3:
                 if verbose:
-                    print(f"  Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                    print(f"  Early stopping at epoch {epoch+1}")
                 break
 
-        # Use EMA weights for sampling (more stable)
+        # Use EMA weights
         self.denoiser.load_state_dict(ema_denoiser.state_dict())
         self.privacy = None
-
         self._fit_epochs = epochs
         self._fit_batch = batch_size
         self._sampling_steps = 200
+
+        # Store data statistics for proper sample clipping
+        self._data_min = float(X_tr.min())
+        self._data_max = float(X_tr.max())
 
         if verbose:
             print("  Training complete.")
             print("=" * 70)
 
         return self
-
+        
     @torch.no_grad()
     def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.5):
         """Single reverse diffusion step with classifier-free guidance.
@@ -377,12 +390,9 @@ class MATDiffPipeline:
         else:
             return mean
 
-    @torch.no_grad()
-    def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, guidance_scale=2.0):
-        """DDIM deterministic sampling step — faster and higher quality than DDPM.
-        
-        guidance_scale=2.0 provides strong class conditioning for imbalanced data.
-        """
+        @torch.no_grad()
+    def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, guidance_scale=1.5):
+        """DDIM deterministic sampling step."""
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
@@ -390,7 +400,7 @@ class MATDiffPipeline:
         # Conditional prediction
         noise_pred_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
-        # Unconditional prediction (null class token)
+        # Unconditional prediction
         y_uncond = torch.full_like(y, self.n_classes)
         curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
         noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
@@ -400,24 +410,27 @@ class MATDiffPipeline:
 
         # DDIM update
         alpha_t = self.alphas_cumprod[t_idx]
-        alpha_prev = self.alphas_cumprod[t_prev_idx] if t_prev_idx >= 0 else torch.tensor(1.0)
-        
+        alpha_prev = self.alphas_cumprod[t_prev_idx] if t_prev_idx >= 0 else torch.tensor(1.0, device=self.device)
+
         # Predict x_0
         x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-        
-        # Clamp x0 for stability
-        x0_pred = torch.clamp(x0_pred, -3.0, 3.0)
-        
+
+        # Clamp x0 to training data range (CRITICAL for tabular data)
+        data_min = getattr(self, '_data_min', 0.0)
+        data_max = getattr(self, '_data_max', 1.0)
+        margin = (data_max - data_min) * 0.1  # 10% margin
+        x0_pred = torch.clamp(x0_pred, data_min - margin, data_max + margin)
+
         # Direction pointing to x_t
         dir_xt = torch.sqrt(1 - alpha_prev) * noise_pred
-        
-        # DDIM (deterministic, eta=0)
+
+        # DDIM deterministic step
         x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt
-        
+
         return x_prev
 
     def sample(self, n_per_class=None):
-        """Generate synthetic samples using DDIM (faster, higher quality)."""
+        """Generate synthetic minority samples using DDIM."""
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
 
@@ -438,10 +451,7 @@ class MATDiffPipeline:
                         deficit = int(majority_count - class_counts.get(c, 0))
                         n_per_class[c] = max(alloc[c], deficit)
 
-        # Determine number of DDIM steps
         sampling_steps = getattr(self, '_sampling_steps', 200)
-        
-        # Create DDIM timestep subsequence
         step_size = max(1, self.total_timesteps // sampling_steps)
         ddim_timesteps = list(range(0, self.total_timesteps, step_size))
         if ddim_timesteps[-1] != self.total_timesteps - 1:
@@ -451,6 +461,10 @@ class MATDiffPipeline:
         all_X, all_y = [], []
         MAX_BATCH = 512
 
+        # Data range for clipping
+        data_min = getattr(self, '_data_min', 0.0)
+        data_max = getattr(self, '_data_max', 1.0)
+
         for class_label, n_needed in n_per_class.items():
             if n_needed <= 0:
                 continue
@@ -458,7 +472,7 @@ class MATDiffPipeline:
 
             self.denoiser.eval()
 
-            # Compute curvature normalization once
+            # Curvature normalization
             import math as _math
             curv_val = self.fisher.curvatures.get(class_label, 1.0)
             all_curvs = list(self.fisher.curvatures.values())
@@ -467,14 +481,23 @@ class MATDiffPipeline:
             log_range = max(log_curvs) - log_min
             curv_norm = (_math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
 
-            # Generate in batches
+            # Adaptive guidance: lower for classes with few training samples
+            class_count = int(np.sum(self.y_train == class_label))
+            total_samples = len(self.y_train)
+            # More samples = can use stronger guidance; fewer = be conservative
+            if class_count < 50:
+                guidance = 1.0
+            elif class_count < 200:
+                guidance = 1.25
+            else:
+                guidance = 1.5
+
             n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
             class_samples = []
 
             for batch_idx in range(n_batches):
                 samples_generated = sum(len(s) for s in class_samples)
                 batch_size = min(MAX_BATCH, n_needed - samples_generated)
-
                 if batch_size <= 0:
                     break
 
@@ -482,14 +505,15 @@ class MATDiffPipeline:
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
 
-                # DDIM reverse diffusion (much faster than full 1000 steps)
+                # DDIM reverse diffusion
                 for i in reversed(range(len(ddim_timesteps))):
                     t = ddim_timesteps[i]
                     t_prev = ddim_timesteps[i - 1] if i > 0 else -1
-                    x_t = self._ddim_sample_step(x_t, t, t_prev, y=y_cond, curvature=curvature)
+                    x_t = self._ddim_sample_step(x_t, t, t_prev, y=y_cond, 
+                                                  curvature=curvature, guidance_scale=guidance)
 
-                # Clamp to reasonable range
-                x_t = torch.clamp(x_t, -2.0, 2.0)
+                # Clamp to training data range
+                x_t = torch.clamp(x_t, data_min, data_max)
                 class_samples.append(x_t.cpu().numpy())
 
             X_syn = np.vstack(class_samples)
@@ -554,6 +578,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
