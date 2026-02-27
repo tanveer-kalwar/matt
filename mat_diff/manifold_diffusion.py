@@ -173,7 +173,7 @@ class MATDiffPipeline:
 
         self.denoiser = MATDiffDenoiser(
             d_in=self.n_features,
-            num_classes=self.n_classes + 1,
+            num_classes=self.n_classes,
             d_model=self.d_model,
             d_hidden=self.d_hidden,
             n_blocks=self.n_blocks,
@@ -229,8 +229,8 @@ class MATDiffPipeline:
 
         self.denoiser.train()
 
-        # CRITICAL: Minority-focused balanced sampling
-        # Oversample minority classes MORE aggressively during training
+        # Balanced sampling: each class seen equally per epoch
+        # NO minority boost — it causes overfitting on small minority sets
         unique_labels = torch.unique(y_tensor).tolist()
         class_indices = {}
         for c in unique_labels:
@@ -239,15 +239,8 @@ class MATDiffPipeline:
         class_counts = {int(c): len(v) for c, v in class_indices.items()}
         max_class_size = max(class_counts.values())
         
-        # For training, minority classes are repeated to 2x majority
-        # This ensures the model sees more minority variation
-        minority_boost = 2
-        samples_per_class = {}
-        for c, count in class_counts.items():
-            if count < max_class_size:
-                samples_per_class[c] = max_class_size * minority_boost
-            else:
-                samples_per_class[c] = max_class_size
+        # Equal representation per class (standard balanced sampling)
+        samples_per_class = {c: max_class_size for c in class_counts}
 
         best_loss = float('inf')
         patience = 80
@@ -283,13 +276,12 @@ class MATDiffPipeline:
                 noise = torch.randn_like(x_batch)
                 x_noisy = self._q_sample(x_batch, t, noise)
 
-                # CFG: drop labels 10% of the time (less aggressive for small datasets)
-                drop_rate = 0.10
-                drop_mask = torch.rand(len(x_batch), device=self.device) < drop_rate
+                # NO CFG dropping — always condition on class
+                # CFG requires large datasets to learn good unconditional model.
+                # With tiny minority classes, unconditional model is dominated by majority,
+                # and guidance amplifies majority-biased noise.
                 y_cfg = y_batch.clone()
-                y_cfg[drop_mask] = self.n_classes
                 curv_cfg = curv_batch.clone()
-                curv_cfg[drop_mask] = 0.0
 
                 noise_pred = self.denoiser(
                     x_noisy, t, y=y_cfg, curvature=curv_cfg
@@ -365,16 +357,8 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Conditional prediction
-        noise_pred_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-
-        # Unconditional prediction (null class token)
-        y_uncond = torch.full_like(y, self.n_classes)
-        curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
-        noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
-
-        # Fixed guidance scale (no adaptive scaling)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        # Pure conditional prediction — no CFG
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -397,16 +381,8 @@ class MATDiffPipeline:
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Conditional prediction
-        noise_pred_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-
-        # Unconditional prediction
-        y_uncond = torch.full_like(y, self.n_classes)
-        curv_uncond = torch.zeros_like(curvature) if curvature is not None else None
-        noise_pred_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curv_uncond)
-
-        # Classifier-free guidance
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        # Pure conditional prediction — no CFG
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
         # DDIM update
         alpha_t = self.alphas_cumprod[t_idx]
@@ -415,11 +391,9 @@ class MATDiffPipeline:
         # Predict x_0
         x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
 
-        # Clamp x0 to training data range (CRITICAL for tabular data)
-        data_min = getattr(self, '_data_min', 0.0)
-        data_max = getattr(self, '_data_max', 1.0)
-        margin = (data_max - data_min) * 0.1  # 10% margin
-        x0_pred = torch.clamp(x0_pred, data_min - margin, data_max + margin)
+        # Clamp x0 to training data range — NO margin
+        # QuantileTransformer maps to [0, 1], samples must stay in [0, 1]
+        x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
 
         # Direction pointing to x_t
         dir_xt = torch.sqrt(1 - alpha_prev) * noise_pred
@@ -481,16 +455,11 @@ class MATDiffPipeline:
             log_range = max(log_curvs) - log_min
             curv_norm = (_math.log1p(curv_val) - log_min) / log_range if log_range > 0 else 0.5
 
-            # Adaptive guidance: lower for classes with few training samples
-            class_count = int(np.sum(self.y_train == class_label))
-            total_samples = len(self.y_train)
-            # More samples = can use stronger guidance; fewer = be conservative
-            if class_count < 50:
-                guidance = 1.0
-            elif class_count < 200:
-                guidance = 1.25
-            else:
-                guidance = 1.5
+            # Fixed guidance = 1.0 for ALL classes
+            # Higher guidance amplifies noise in the conditional prediction,
+            # which is catastrophic for minority classes with limited training data.
+            # DGOT and TabDDPM do NOT use classifier-free guidance at all.
+            guidance = 1.0
 
             n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
             class_samples = []
@@ -512,8 +481,8 @@ class MATDiffPipeline:
                     x_t = self._ddim_sample_step(x_t, t, t_prev, y=y_cond, 
                                                   curvature=curvature, guidance_scale=guidance)
 
-                # Clamp to training data range
-                x_t = torch.clamp(x_t, data_min, data_max)
+                # Clamp to [0, 1] — QuantileTransformer range
+                x_t = torch.clamp(x_t, 0.0, 1.0)
                 class_samples.append(x_t.cpu().numpy())
 
             X_syn = np.vstack(class_samples)
@@ -578,6 +547,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
