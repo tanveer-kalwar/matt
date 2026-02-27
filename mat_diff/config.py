@@ -156,16 +156,17 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     # n_heads: Each head handles ~64 dimensions, minimum 2
     n_heads = max(2, d_model // 64)
 
-    # batch_size: ~6-8 batches per epoch
-    batch_size = min(512, max(64, n_samples // 6))
-    batch_size = 2 ** round(math.log2(batch_size))
+    # Smaller batches for minority-only training (typically 100-500 samples)
+    minority_estimate = max(10, n_samples // max(ir, 2))  # rough minority count
+    batch_size = min(128, max(16, minority_estimate // 4))
+    batch_size = 2 ** round(math.log2(max(16, batch_size)))
 
-    # epochs: scale with IR — harder problems need more training
-    base_epochs = 300
-    ir_bonus = int(50 * math.log2(max(ir, 1)))
-    epochs = min(800, base_epochs + ir_bonus)
+    # More epochs needed because training on minority data only (much smaller)
+    base_epochs = 500
+    ir_bonus = int(80 * math.log2(max(ir, 1)))
+    epochs = min(1500, base_epochs + ir_bonus)
     if n_samples < 500:
-        epochs = min(epochs, 600)
+        epochs = min(epochs, 800)
 
     # d_hidden: 4x d_model (standard transformer ratio)
     d_hidden = d_model * 4
@@ -219,6 +220,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
