@@ -161,11 +161,11 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batch_size = 2 ** round(math.log2(batch_size))
 
     # epochs: scale with IR — harder problems need more training
-    base_epochs = 300
-    ir_bonus = int(50 * math.log2(max(ir, 1)))
-    epochs = min(800, base_epochs + ir_bonus)
+    base_epochs = 400
+    ir_bonus = int(80 * math.log2(max(ir, 1)))
+    epochs = min(1200, base_epochs + ir_bonus)
     if n_samples < 500:
-        epochs = min(epochs, 400)
+        epochs = min(epochs, 600)
 
     # d_hidden: 4x d_model (standard transformer ratio)
     d_hidden = d_model * 4
@@ -219,6 +219,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
