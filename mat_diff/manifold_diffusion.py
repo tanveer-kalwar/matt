@@ -263,14 +263,17 @@ class MATDiffPipeline:
             for start in range(0, len(perm), batch_size):
                 end = min(start + batch_size, len(perm))
                 idx = perm[start:end]
-                # Mixup augmentation: create virtual training samples
-                # Only for minority class samples to improve diversity
+                x_batch = X_tensor[idx]
+                y_batch = y_tensor[idx]
+                curv_batch = curvature_per_sample[idx]
+                w_batch = weight_per_sample[idx]
+
+                # Mixup augmentation: interpolate same-class pairs for diversity
                 if torch.rand(1).item() > 0.5:
-                    perm = torch.randperm(len(x_batch), device=self.device)
-                    lam = torch.rand(len(x_batch), 1, device=self.device) * 0.3  # mild mixup
-                    # Only mixup samples of the same class
-                    same_class = (y_batch == y_batch[perm]).float().unsqueeze(1)
-                    x_batch = x_batch * (1 - lam * same_class) + x_batch[perm] * (lam * same_class)
+                    mix_perm = torch.randperm(len(x_batch), device=self.device)
+                    lam = torch.rand(len(x_batch), 1, device=self.device) * 0.3
+                    same_class = (y_batch == y_batch[mix_perm]).float().unsqueeze(1)
+                    x_batch = x_batch * (1 - lam * same_class) + x_batch[mix_perm] * (lam * same_class)
 
                 t = self.scheduler.sample_timesteps(
                     len(x_batch), epoch, epochs, self.device
@@ -280,32 +283,25 @@ class MATDiffPipeline:
                 noise = torch.randn_like(x_batch)
                 x_noisy = self._q_sample(x_batch, t, noise)
 
-                y_cfg = y_batch.clone()
-                curv_cfg = curv_batch.clone()
-
-                # Self-conditioning: 50% of the time, feed model's own x0 prediction
-                # back as additional signal. This dramatically improves sample quality.
+                # Self-conditioning: 50% of the time, use model's own x0 estimate
                 x_self_cond = torch.zeros_like(x_batch)
                 if torch.rand(1).item() > 0.5:
                     with torch.no_grad():
                         noise_pred_sc = self.denoiser(
-                            x_noisy, t, y=y_cfg, curvature=curv_cfg
+                            x_noisy, t, y=y_batch, curvature=curv_batch
                         )
-                        # Estimate x_0 from noise prediction
                         t_clamped = torch.clamp(t, 0, self.total_timesteps - 1)
                         sqrt_alpha = self.sqrt_alphas_cumprod[t_clamped].view(-1, 1)
                         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t_clamped].view(-1, 1)
                         x_self_cond = ((x_noisy - sqrt_one_minus * noise_pred_sc) / (sqrt_alpha + 1e-8)).detach()
                         x_self_cond = torch.clamp(x_self_cond, 0.0, 1.0)
 
-                # Concatenate self-conditioning to input
-                x_input = x_noisy + x_self_cond * 0.1  # Gentle self-conditioning
+                x_input = x_noisy + x_self_cond * 0.1
 
                 noise_pred = self.denoiser(
-                    x_input, t, y=y_cfg, curvature=curv_cfg
+                    x_input, t, y=y_batch, curvature=curv_batch
                 )
 
-                # Weighted MSE loss
                 loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
                 loss = (loss_per_sample * w_batch).mean()
 
@@ -611,6 +607,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
