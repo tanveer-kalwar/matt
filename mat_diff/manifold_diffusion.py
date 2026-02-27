@@ -98,7 +98,7 @@ class MATDiffPipeline:
 
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
-        def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
+    def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
         """Train with focus on minority class quality."""
         self.X_train = X_train.copy()
         self.y_train = y_train.copy()
@@ -578,6 +578,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
