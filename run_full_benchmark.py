@@ -1105,9 +1105,12 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             
             all_results.append({
                 "Dataset": ds_name, "Variant": variant_name,
-                "F1_Mean": f1_mean, "F1_Std": f1_std,
-                "Acc_Mean": acc_mean, "Acc_Std": acc_std,
-                "MCC_Mean": mcc_mean, "MCC_Std": mcc_std,
+                "F1_Mean": np.mean(variant_results[variant_name]['F1']),
+                "F1_Std": np.std(variant_results[variant_name]['F1']),
+                "Acc_Mean": np.mean(variant_results[variant_name]['Acc']),
+                "Acc_Std": np.std(variant_results[variant_name]['Acc']),
+                "MCC_Mean": np.mean(variant_results[variant_name]['MCC']),
+                "MCC_Std": np.std(variant_results[variant_name]['MCC']),
             })
     
     # Save and display
@@ -1191,6 +1194,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
