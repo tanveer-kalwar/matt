@@ -18,57 +18,6 @@ from typing import Optional
 
 
 class StandardAttentionBlock(nn.Module):
-    """Standard feature-group attention WITHOUT geodesic metric.
-    
-    Used as ablation baseline. Same architecture as GeodesicAttentionBlock
-    but without the learnable Mahalanobis metric — uses identity metric.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        init_fim: Optional[torch.Tensor] = None,  # ignored
-    ):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
-        self.W_out = nn.Linear(d_model, d_model)
-
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Feature-group Geodesic Attention."""
-        B, D = x.shape
-        residual = x
-
-        Q = self.W_q(x).view(B, self.n_heads, self.d_head)
-        K = self.W_k(x).view(B, self.n_heads, self.d_head)
-        V = self.W_v(x).view(B, self.n_heads, self.d_head)
-
-        # Mahalanobis-transformed attention
-        L_mean = self.L.mean(dim=0)
-        Q_t = torch.matmul(Q, L_mean)
-        K_t = torch.matmul(K, L_mean)
-
-        attn = torch.bmm(Q_t, K_t.transpose(1, 2)) / math.sqrt(self.d_head)
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.bmm(attn, V).reshape(B, D)
-        out = self.W_out(out)
-        return self.layer_norm(out + residual)
-
-class StandardAttentionBlock(nn.Module):
     """Standard feature-group attention WITHOUT geodesic metric (ablation baseline)."""
 
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1,
@@ -191,4 +140,5 @@ class GeodesicAttentionBlock(nn.Module):
         out = torch.bmm(attn, V).reshape(B, D)
         out = self.W_out(out)
         return self.layer_norm(out + residual)
+
 
