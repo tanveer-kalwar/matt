@@ -226,6 +226,13 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
         target_col = df.columns[-1]
 
     df = df.dropna(subset=[target_col])
+    # CRITICAL: reset_index after dropna so index is contiguous 0,1,2,...
+    # Without this, SimpleImputer assigns back a numpy array by position
+    # but pandas tries to match by the original non-contiguous index,
+    # causing "Columns must be same length as key" for thyroid_sick.
+    df = df.reset_index(drop=True)
+
+    df = df.dropna(subset=[target_col])
 
     y_raw = df[target_col].values
     X_df = df.drop(columns=[target_col])
@@ -302,3 +309,4 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
