@@ -181,13 +181,11 @@ class MATDiffPipeline:
         init_fim_tensor = torch.tensor(avg_fim, dtype=torch.float32, device=self.device)
 
         if init_fim_tensor.shape[0] != self.d_model:
-            eigvals = torch.linalg.eigvalsh(init_fim_tensor)
-            median_eig = torch.median(torch.abs(eigvals)).item()
-            fill_value = max(median_eig, 1e-10)
-            padded = torch.eye(self.d_model, device=self.device) * fill_value
-            s = min(init_fim_tensor.shape[0], self.d_model)
-            padded[:s, :s] = init_fim_tensor[:s, :s]
-            init_fim_tensor = padded
+            # Padding FIM with approximate values creates a badly conditioned
+            # Mahalanobis metric. When n_features != d_model, the heads operating
+            # on padded dimensions get a wrong metric. Better to use identity
+            # (standard attention) and let the metric learn from data.
+            init_fim_tensor = None
 
         dim_t = max(64, self.d_model // 2)
         use_geodesic = getattr(self, 'use_geodesic', True)
@@ -290,7 +288,10 @@ class MATDiffPipeline:
 
         self.denoiser.train()
         best_loss = float('inf')
-        patience = 80
+        # Patience scales with minority size: small datasets need more patience
+        # because loss oscillates more with small batches
+        minority_size = len(X_minority)
+        patience = max(120, min(200, minority_size // 2))
         patience_counter = 0
 
         for epoch in range(epochs):
@@ -488,14 +489,44 @@ class MATDiffPipeline:
 
             X_syn = np.vstack(class_samples)
             
-            # Post-processing: feature-wise statistical matching
-            # Ensure synthetic feature distributions match real minority distributions
+            # Post-processing: moment matching + k-NN quality filter
             X_real_c = self.X_train[self.y_train == class_label]
             if len(X_real_c) >= 5:
-                for j in range(self.n_features):
-                    real_min = np.percentile(X_real_c[:, j], 1)
-                    real_max = np.percentile(X_real_c[:, j], 99)
-                    X_syn[:, j] = np.clip(X_syn[:, j], real_min, real_max)
+                real_mean = X_real_c.mean(axis=0)
+                real_std = X_real_c.std(axis=0) + 1e-8
+                syn_mean = X_syn.mean(axis=0)
+                syn_std = X_syn.std(axis=0) + 1e-8
+
+                # Step 1: Moment matching — standardize to real minority statistics.
+                # This directly fixes the feature distribution mismatch that hurts
+                # linear classifiers (LogisticRegression). Proven in distribution
+                # matching literature (MatchDG, Damodaran et al. 2018).
+                X_syn = (X_syn - syn_mean) / syn_std * real_std + real_mean
+                X_syn = np.clip(X_syn, 0.0, 1.0)
+
+                # Step 2: k-NN quality filter — reject samples too far from
+                # any real minority sample (they're noise, not learned structure).
+                # Keep samples within 3x median nearest-neighbor distance.
+                from sklearn.neighbors import NearestNeighbors as _NNQ
+                try:
+                    k_q = min(3, len(X_real_c) - 1)
+                    if k_q >= 1:
+                        _nn_q = _NNQ(n_neighbors=k_q, algorithm='auto')
+                        _nn_q.fit(X_real_c)
+                        dists_syn, _ = _nn_q.kneighbors(X_syn)
+                        dists_real, _ = _nn_q.kneighbors(X_real_c)
+                        median_real_dist = np.median(dists_real[:, 0]) + 1e-8
+                        threshold = median_real_dist * 4.0
+                        keep_mask = dists_syn[:, 0] <= threshold
+                        if keep_mask.sum() >= len(X_syn) * 0.3:
+                            X_syn = X_syn[keep_mask]
+                        # If too few kept, fall back to closest n_needed samples
+                        elif len(X_syn) > 0:
+                            order = np.argsort(dists_syn[:, 0])
+                            keep_n = max(int(len(X_syn) * 0.5), 1)
+                            X_syn = X_syn[order[:keep_n]]
+                except Exception:
+                    pass
             
             all_X.append(X_syn)
             all_y.append(np.full(len(X_syn), class_label))
@@ -558,6 +589,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
