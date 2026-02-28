@@ -913,23 +913,39 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     """
     Ablation: Train once on 80% data, evaluate n_seeds times.
-    Same protocol as benchmark. IDENTICAL model used for 'MAT-Diff (Ours)'.
-    Each ablation properly removes exactly ONE component.
+    Same protocol as DGOT Table IX. IDENTICAL model for 'MAT-Diff (Ours)'.
+    Each ablation removes EXACTLY ONE component.
+
+    Output format:
+        Summary table:   Variant | F1 mean ± std | Acc mean ± std | MCC mean ± std
+        Classifier table: Variant | XGB mean±std | DTC mean±std | ...
+        Final pivot:      Dataset columns, Variant rows, "0.XXXX ± 0.XXXX" values
     """
-    
+    # Import here to avoid circular imports when used as standalone
+    from mat_diff.config import get_matdiff_config
+    from mat_diff.data_fetcher import load_dataset
+    from mat_diff.manifold_diffusion import MATDiffPipeline
+
+    # Reuse evaluate_utility from the outer benchmark module
+    # (defined in mat_diff_full_benchmark.py)
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from mat_diff_full_benchmark import evaluate_utility
+
     print("\n" + "=" * 120)
     print("ABLATION STUDY: Train once per variant, evaluate 10 times")
     print("=" * 120)
-    
+
     ABLATION_VARIANTS = {
-        "IDENTITY": "No oversampling baseline",
-        "w/o Fisher": "Disable Fisher loss weighting (uniform weights)",
-        "w/o Geodesic": "Replace Geodesic Attention with standard attention",
-        "w/o Spectral": "Replace Spectral Curriculum with uniform linear schedule",
-        "MAT-Diff (Ours)": "Full model with all components",
+        "IDENTITY":         "No oversampling baseline",
+        "w/o Fisher":       "Disable Fisher loss weighting (uniform weights)",
+        "w/o Geodesic":     "Replace Geodesic Attention with standard attention",
+        "w/o Spectral":     "Replace Spectral Curriculum with uniform linear schedule",
+        "MAT-Diff (Ours)":  "Full model with all components",
     }
-    
+
     all_results = []
+
     for ds_name in datasets:
         print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
 
@@ -937,8 +953,9 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             X_tr_full, y_tr_full, X_te_full, y_te_full = load_dataset(ds_name)
             X_all = np.vstack([X_tr_full, X_te_full])
             y_all = np.hstack([y_tr_full, y_te_full])
-            
+
             if len(np.unique(y_all)) < 2:
+                print(f"  SKIP: only 1 class")
                 continue
             print(f"  Total: {len(X_all)} samples")
 
@@ -948,181 +965,226 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
         cfg = get_matdiff_config(ds_name)
         FIXED_EPOCHS = cfg["epochs"]
-        
-        # Train 80% split (seed=42) — same as benchmark
-        from sklearn.model_selection import train_test_split
+
+        # Train 80% split (seed=42) — same as benchmark protocol
         X_tr_80, _, y_tr_80, _ = train_test_split(
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
-        
+
         print(f"\n  [TRAINING PHASE - Train each variant once on {len(X_tr_80)} samples]")
-        
+
         # Train all variants ONCE and store their synthetic samples
         trained_samples = {}  # variant_name -> (X_syn, y_syn)
-        
+
         for variant_name in ABLATION_VARIANTS:
             if variant_name == "IDENTITY":
                 continue
-            
+
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
-            
-            # Configure variant — each ablation changes EXACTLY ONE component properly
+
             use_fisher_weights = True
             use_geodesic = True
-            n_blocks = cfg["n_blocks"]
             n_phases = cfg["n_phases"]
-            
+
             if variant_name == "w/o Fisher":
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
                 use_fisher_weights = False
-                
             elif variant_name == "w/o Geodesic":
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks = cfg["n_blocks"]
-                n_phases = cfg["n_phases"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
                 use_geodesic = False
-                
             elif variant_name == "w/o Spectral":
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks = cfg["n_blocks"]
                 n_phases = 1
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
-                
-            else:  # MAT-Diff (Ours)
-                d_model, d_hidden, n_heads = cfg["d_model"], cfg["d_hidden"], cfg["n_heads"]
-                n_blocks = cfg["n_blocks"]
-                n_phases = cfg["n_phases"]
-                lr, epochs = cfg["lr"], FIXED_EPOCHS
-                total_timesteps = cfg["total_timesteps"]
-            
-            # Train
+            # MAT-Diff (Ours): all defaults
+
             try:
                 pipeline = MATDiffPipeline(
-                    device=device, d_model=d_model, d_hidden=d_hidden,
-                    n_blocks=n_blocks, n_heads=n_heads, n_phases=n_phases,
-                    total_timesteps=total_timesteps, dropout=cfg.get("dropout", 0.1), lr=lr,
+                    device=device,
+                    d_model=cfg["d_model"],
+                    d_hidden=cfg["d_hidden"],
+                    n_blocks=cfg["n_blocks"],
+                    n_heads=cfg["n_heads"],
+                    n_phases=n_phases,
+                    total_timesteps=cfg["total_timesteps"],
+                    dropout=cfg.get("dropout", 0.1),
+                    lr=cfg["lr"],
                     weight_decay=cfg.get("weight_decay", 1e-5),
                 )
                 pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.use_geodesic = use_geodesic
                 pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
-                            batch_size=cfg["batch_size"], verbose=False)
-                
-                # Sample ONCE and store
+                             batch_size=cfg["batch_size"], verbose=False)
+
                 X_syn_raw, y_syn_raw = pipeline.sample()
                 trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
                 print("✓")
             except Exception as e:
-                print(f"FAILED: {str(e)[:50]}")
-        
-        # Evaluate all variants on n_seeds splits
+                print(f"FAILED: {str(e)[:80]}")
+
+        # ── Evaluate all variants on n_seeds different 80/20 splits ──
         print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
-        
-        variant_results = {var: {'F1': [], 'Acc': [], 'MCC': [],
-                                 'F1_per_clf': {cn: [] for cn in CLF_NAMES}}
-                           for var in ABLATION_VARIANTS}
-        
+
+        # Storage: per variant, list of per-seed scalars
+        # variant_results[var]['F1'] = [seed0, seed1, ..., seed9]
+        # variant_results[var]['F1_per_clf'][clf] = [seed0, ..., seed9]
+        variant_results = {
+            var: {
+                'F1': [], 'Acc': [], 'MCC': [],
+                'F1_per_clf': {cn: [] for cn in CLF_NAMES}
+            }
+            for var in ABLATION_VARIANTS
+        }
+
         for seed in range(n_seeds):
             print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
-            
+
             X_tr, X_te, y_tr, y_te = train_test_split(
                 X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
             )
-            
+
             cc = Counter(y_tr)
             majority_count = max(cc.values())
             minority_label = min(cc, key=cc.get)
             needed = majority_count - cc[minority_label]
-            
+
             for variant_name in ABLATION_VARIANTS:
                 if variant_name == "IDENTITY":
                     X_aug, y_aug = X_tr, y_tr
                 elif variant_name in trained_samples:
                     X_syn_raw, y_syn_raw = trained_samples[variant_name]
-                    
-                    # Use same augmentation logic as benchmark
                     mask = (y_syn_raw == minority_label)
                     X_syn = X_syn_raw[mask][:needed]
-                    y_syn = np.full(len(X_syn), minority_label)
-                    
+                    y_syn_part = np.full(len(X_syn), minority_label)
                     if len(X_syn) > 0:
                         X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn])
+                        y_aug = np.hstack([y_tr, y_syn_part])
                     else:
                         X_aug, y_aug = X_tr, y_tr
                 else:
                     X_aug, y_aug = X_tr, y_tr
-                
-                # Evaluate
+
                 clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
-                
-                f1_avg = np.mean([clf_results[cn]["F1"] for cn in CLF_NAMES])
+
+                f1_avg  = np.mean([clf_results[cn]["F1"]  for cn in CLF_NAMES])
                 acc_avg = np.mean([clf_results[cn]["Acc"] for cn in CLF_NAMES])
                 mcc_avg = np.mean([clf_results[cn]["MCC"] for cn in CLF_NAMES])
-                
+
                 variant_results[variant_name]['F1'].append(f1_avg)
                 variant_results[variant_name]['Acc'].append(acc_avg)
                 variant_results[variant_name]['MCC'].append(mcc_avg)
                 for cn in CLF_NAMES:
-                    variant_results[variant_name]['F1_per_clf'][cn].append(clf_results[cn]["F1"])
-            
-            # Print per-classifier F1 for this seed (matching DGOT protocol)
-            seed_summary = []
-            for var in ABLATION_VARIANTS:
-                seed_summary.append(f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}")
-            print(" | ".join(seed_summary))
-        
-        # Aggregate results
-        print(f"\n  [Dataset Summary — Average across 5 classifiers]")
+                    variant_results[variant_name]['F1_per_clf'][cn].append(
+                        clf_results[cn]["F1"])
+
+            # Compact per-seed progress line
+            seed_parts = [
+                f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}"
+                for var in ABLATION_VARIANTS
+            ]
+            print(" | ".join(seed_parts))
+
+        # ────────────────────────────────────────────────────────────
+        # Summary with ± values (mean ± std across 10 seeds)
+        # This is the IEEE TKDE format used by DGOT, GOIO, and others.
+        # ────────────────────────────────────────────────────────────
+        print(f"\n  [Dataset Summary — mean ± std across {n_seeds} seeds × 5 classifiers]")
+        print(f"    {'Variant':<20s} {'F1':>16s}  {'Acc':>16s}  {'MCC':>16s}")
+        print(f"    {'─'*20} {'─'*16}  {'─'*16}  {'─'*16}")
+
         for variant_name in ABLATION_VARIANTS:
-            f1_mean = np.mean(variant_results[variant_name]['F1'])
-            f1_std = np.std(variant_results[variant_name]['F1'])
-            acc_mean = np.mean(variant_results[variant_name]['Acc'])
-            acc_std = np.std(variant_results[variant_name]['Acc'])
-            mcc_mean = np.mean(variant_results[variant_name]['MCC'])
-            mcc_std = np.std(variant_results[variant_name]['MCC'])
-            
-            print(f"    {variant_name:<20s} F1: {f1_mean:.4f} ± {f1_std:.4f}  Acc: {acc_mean:.4f} ± {acc_std:.4f}  MCC: {mcc_mean:.4f} ± {mcc_std:.4f}")
-        
-        print(f"\n  [Per-Classifier F1 — This is what DGOT/GOIO papers report]")
-        print(f"    {'Variant':<20s} {'XGB':>8s} {'DTC':>8s} {'Logit':>8s} {'RFC':>8s} {'KNN':>8s}")
-        print(f"    {'─'*20} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            f1_vals  = variant_results[variant_name]['F1']
+            acc_vals = variant_results[variant_name]['Acc']
+            mcc_vals = variant_results[variant_name]['MCC']
+
+            f1_mean,  f1_std  = np.mean(f1_vals),  np.std(f1_vals)
+            acc_mean, acc_std = np.mean(acc_vals), np.std(acc_vals)
+            mcc_mean, mcc_std = np.mean(mcc_vals), np.std(mcc_vals)
+
+            f1_str  = f"{f1_mean:.4f} ± {f1_std:.4f}"
+            acc_str = f"{acc_mean:.4f} ± {acc_std:.4f}"
+            mcc_str = f"{mcc_mean:.4f} ± {mcc_std:.4f}"
+
+            print(f"    {variant_name:<20s} {f1_str:>16s}  {acc_str:>16s}  {mcc_str:>16s}")
+
+        # ────────────────────────────────────────────────────────────
+        # Per-classifier breakdown with ± values
+        # ────────────────────────────────────────────────────────────
+        print(f"\n  [Per-Classifier F1 — mean ± std across {n_seeds} seeds]")
+        clf_col_w = 16
+        header = f"    {'Variant':<20s}"
+        for cn in CLF_NAMES:
+            header += f" {cn:>{clf_col_w}s}"
+        print(header)
+        print(f"    {'─'*20}" + f" {'─'*clf_col_w}" * len(CLF_NAMES))
+
         for variant_name in ABLATION_VARIANTS:
-            clf_f1s = []
+            row = f"    {variant_name:<20s}"
             for cn in CLF_NAMES:
                 vals = variant_results[variant_name]['F1_per_clf'][cn]
-                clf_f1s.append(np.mean(vals) if vals else 0.0)
-            print(f"    {variant_name:<20s} {clf_f1s[0]:>8.4f} {clf_f1s[1]:>8.4f} {clf_f1s[2]:>8.4f} {clf_f1s[3]:>8.4f} {clf_f1s[4]:>8.4f}")
-            
+                m, s = np.mean(vals), np.std(vals)
+                row += f" {f'{m:.4f}±{s:.4f}':>{clf_col_w}s}"
+            print(row)
+
+        # Store results
+        for variant_name in ABLATION_VARIANTS:
+            f1_vals  = variant_results[variant_name]['F1']
+            acc_vals = variant_results[variant_name]['Acc']
+            mcc_vals = variant_results[variant_name]['MCC']
+
+            # Also compute per-classifier means and stds for CSV
+            clf_means = {}
+            clf_stds  = {}
+            for cn in CLF_NAMES:
+                vals = variant_results[variant_name]['F1_per_clf'][cn]
+                clf_means[cn] = np.mean(vals) if vals else np.nan
+                clf_stds[cn]  = np.std(vals)  if vals else np.nan
+
             all_results.append({
-                "Dataset": ds_name, "Variant": variant_name,
-                "F1_Mean": np.mean(variant_results[variant_name]['F1']),
-                "F1_Std": np.std(variant_results[variant_name]['F1']),
-                "Acc_Mean": np.mean(variant_results[variant_name]['Acc']),
-                "Acc_Std": np.std(variant_results[variant_name]['Acc']),
-                "MCC_Mean": np.mean(variant_results[variant_name]['MCC']),
-                "MCC_Std": np.std(variant_results[variant_name]['MCC']),
+                "Dataset":    ds_name,
+                "Variant":    variant_name,
+                "F1_Mean":    np.mean(f1_vals),
+                "F1_Std":     np.std(f1_vals),
+                "Acc_Mean":   np.mean(acc_vals),
+                "Acc_Std":    np.std(acc_vals),
+                "MCC_Mean":   np.mean(mcc_vals),
+                "MCC_Std":    np.std(mcc_vals),
+                # Per-classifier F1
+                **{f"F1_{cn}_Mean": clf_means[cn] for cn in CLF_NAMES},
+                **{f"F1_{cn}_Std":  clf_stds[cn]  for cn in CLF_NAMES},
             })
-    
-    # Save and display
+
+    # ────────────────────────────────────────────────────────────────
+    # Final summary pivot table: "mean ± std" cells
+    # ────────────────────────────────────────────────────────────────
     if all_results:
         df = pd.DataFrame(all_results)
         df.to_csv("ablation_results.csv", index=False)
-        
+
         print("\n" + "=" * 120)
-        print("ABLATION SUMMARY")
+        print("ABLATION SUMMARY  (F1: mean ± std across 10 evaluation seeds)")
         print("=" * 120)
-        pivot = df.pivot(index="Variant", columns="Dataset", values="F1_Mean")
+
+        # Build pivot with formatted "mean ± std" strings
+        pivot_data = {}
         order = ["IDENTITY", "w/o Fisher", "w/o Geodesic", "w/o Spectral", "MAT-Diff (Ours)"]
-        pivot = pivot.reindex(order)
-        print(pivot.to_string(float_format=lambda x: f"{x:.4f}"))
+
+        for ds_name in df["Dataset"].unique():
+            pivot_data[ds_name] = {}
+            ds_df = df[df["Dataset"] == ds_name]
+            for _, row in ds_df.iterrows():
+                var = row["Variant"]
+                cell = f"{row['F1_Mean']:.4f} ± {row['F1_Std']:.4f}"
+                pivot_data[ds_name][var] = cell
+
+        pivot_df = pd.DataFrame(pivot_data).reindex(order)
+        print(pivot_df.to_string())
         print("=" * 120)
-        
+
+        # Also print a clean numeric-only pivot for quick comparison
+        print("\nNUMERIC PIVOT (F1 mean only — for quick ranking)")
+        print("=" * 120)
+        pivot_num = df.pivot(index="Variant", columns="Dataset", values="F1_Mean")
+        pivot_num = pivot_num.reindex(order)
+        print(pivot_num.to_string(float_format=lambda x: f"{x:.4f}"))
+        print("=" * 120)
+
     return all_results
     
 def main():
@@ -1190,6 +1252,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
