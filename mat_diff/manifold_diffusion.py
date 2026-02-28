@@ -181,20 +181,21 @@ class MATDiffPipeline:
         init_fim_tensor = torch.tensor(avg_fim, dtype=torch.float32, device=self.device)
 
         if init_fim_tensor.shape[0] != self.d_model:
-            # Project FIM into d_model space via top-d_model eigenvectors.
-            # This preserves the actual geometric structure from FIM rather
-            # than discarding it (None) or padding with zeros.
-            try:
-                eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
-                # Take top d_model eigenvectors (largest eigenvalues)
-                k = min(self.d_model, init_fim_tensor.shape[0])
-                top_vecs = eigvecs[:, -k:]  # (n_features, k)
-                top_vals = eigvals[-k:].clamp(min=1e-10)
-                # Reconstruct in d_model space
-                projected = torch.zeros(self.d_model, self.d_model, device=self.device)
-                projected[:k, :k] = torch.diag(top_vals)
-                init_fim_tensor = projected
-            except Exception:
+            if init_fim_tensor.shape[0] > self.d_model:
+                # Project DOWN: n_features > d_model (valid — reduces dimensionality).
+                # Keep the top d_model eigenvectors with largest eigenvalues.
+                # This is mathematically sound: PCA-style reduction of FIM.
+                try:
+                    eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
+                    top_vals = eigvals[-self.d_model:].clamp(min=1e-10)
+                    init_fim_tensor = torch.diag(top_vals)
+                except Exception:
+                    init_fim_tensor = None
+            else:
+                # Project UP: n_features < d_model (INVALID — cannot add information).
+                # A 6x6 FIM padded into 64x64 with zeros creates a rank-6 matrix
+                # where 58 attention dimensions have zero metric → degenerate geometry.
+                # Use None so geodesic attention falls back to its learned initialization.
                 init_fim_tensor = None
 
         dim_t = max(64, self.d_model // 2)
@@ -608,6 +609,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
