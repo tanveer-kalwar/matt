@@ -16,23 +16,25 @@ Hyperparameter derivation rules:
               Each attention head handles approximately 64 dimensions
     batch_size: min(256, max(32, n_samples // 8))
               Approximately 8 batches per epoch for stable gradient estimates
-    epochs:   Scaled by IR: base=300, +50*log2(IR), capped at 800
+    epochs:   Scaled by IR: base=500, +80*log2(IR), capped at 1500
               Higher imbalance requires longer training
-    lr:       2e-4 (AdamW default learning rate)
+    lr:       4e-4
+
 """
 
 import math
 from typing import Dict, Any
 
 # ── All 33 Benchmark Datasets ──
-# Each entry: target description, download source, n_classes, binary flag
 DATASET_REGISTRY = {
     # Abalone variants
-    "abalone_6":        {"source": "openml", "openml_id": 720,   "target": "Rings", "binary": True,
+    # CORRECTED: openml_id=183 (verified: 4177 samples, target="Class_Rings", int 1-29)
+    # openml_id=720 is incorrect and loads a completely different balanced dataset.
+    "abalone_6":        {"source": "openml", "openml_id": 183,   "target": "Class_Rings", "binary": True,
                          "minority_rule": "le_6",   "n_samples": 4177, "n_features": 8, "ir": 17.66},
-    "abalone_15":       {"source": "openml", "openml_id": 720,   "target": "Rings", "binary": True,
+    "abalone_15":       {"source": "openml", "openml_id": 183,   "target": "Class_Rings", "binary": True,
                          "minority_rule": "ge_15",  "n_samples": 4177, "n_features": 8, "ir": 15.0},
-    "abalone_19":       {"source": "openml", "openml_id": 720,   "target": "Rings", "binary": True,
+    "abalone_19":       {"source": "openml", "openml_id": 183,   "target": "Class_Rings", "binary": True,
                          "minority_rule": "eq_19",  "n_samples": 4177, "n_features": 8, "ir": 129.5},
     # Avila variants
     "avila":            {"source": "openml", "openml_id": 1489,  "target": "Class", "binary": True,
@@ -54,8 +56,9 @@ DATASET_REGISTRY = {
     # Insurance / Marketing
     "coil_2000":        {"source": "openml", "openml_id": 299,   "target": "V86", "binary": True,
                          "minority_rule": "minority", "n_samples": 9822, "n_features": 85, "ir": 16.0},
-    # Agriculture
-    "Dry_Beans":        {"source": "openml", "openml_id": 43797, "target": "Class", "binary": False,
+    # Agriculture — CORRECTED: UCI id=602 (13,611 samples, 7 classes, Koklu & Ozkan 2020)
+    # OpenML id=43797 is a different 589-sample dataset and must NOT be used.
+    "Dry_Beans":        {"source": "uci",    "uci_id": 602,       "target": "Class", "binary": False,
                          "minority_rule": "minority", "n_samples": 13611, "n_features": 16, "ir": 6.8},
     # Network
     "firewall":         {"source": "openml", "openml_id": 43560, "target": "Action", "binary": True,
@@ -99,13 +102,15 @@ DATASET_REGISTRY = {
     # Finance
     "taiwanese":        {"source": "openml", "openml_id": 42477, "target": "default.payment.next.month", "binary": True,
                          "minority_rule": "minority", "n_samples": 6819, "n_features": 94, "ir": 30.0},
-    # Medical
+    # Medical — CORRECTED: n_features=29 (actual feature count after removing target).
+    # Target values are "sick." and "negative." — cleaned in data_fetcher._clean_target_values().
+    # Dataset has many missing values ("?") — handled by imputation in data_fetcher._impute_features().
     "thyroid_sick":     {"source": "openml", "openml_id": 38,    "target": "Class", "binary": True,
-                         "minority_rule": "minority", "n_samples": 3772, "n_features": 52, "ir": 15.33},
+                         "minority_rule": "minority", "n_samples": 3772, "n_features": 29, "ir": 15.33},
     # Food
     "wine_quality":     {"source": "openml", "openml_id": 287,   "target": "class", "binary": True,
                          "minority_rule": "le_4",   "n_samples": 4898, "n_features": 11, "ir": 25.77},
-    # Yeast (added to reach 33 datasets)
+    # Yeast
     "yeast":            {"source": "openml", "openml_id": 181,   "target": "class", "binary": False,
                          "minority_rule": "minority", "n_samples": 1484, "n_features": 8, "ir": 28.1},
 }
@@ -163,7 +168,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     n_heads = max(2, d_model // 64)
 
     # Smaller batches for minority-only training (typically 100-500 samples)
-    minority_estimate = max(10, n_samples // max(ir, 2))  # rough minority count
+    minority_estimate = max(10, n_samples // max(ir, 2))
     batch_size = min(128, max(16, minority_estimate // 4))
     batch_size = 2 ** round(math.log2(max(16, batch_size)))
 
@@ -178,7 +183,6 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     d_hidden = d_model * 4
 
     # n_phases: Only use multiple phases if enough features to partition
-    # and enough samples per feature for the split to be meaningful
     if n_features >= 30 and spf >= 10:
         n_phases = 3
     elif n_features >= 15 and spf >= 10:
@@ -190,7 +194,6 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     dropout = 0.15 if spf < 20 else 0.1
     weight_decay = 1e-4 if spf < 20 else 1e-5
 
-    # Sampling steps: fewer steps with DDIM for speed + quality
     sampling_steps = 200
 
     return {
@@ -209,13 +212,13 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "n_seeds": 10,
     }
 
+
 def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     """Get fully-derived config for any dataset. Zero manual tuning."""
     if dataset_name not in DATASET_REGISTRY:
         return derive_hyperparams(n_samples=1000, n_features=10, n_classes=2, ir=10.0)
 
     info = DATASET_REGISTRY[dataset_name]
-    # Use 80% of samples (training size after split)
     train_samples = info["n_samples"]
     cfg = derive_hyperparams(
         n_samples=train_samples,
@@ -226,25 +229,3 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
