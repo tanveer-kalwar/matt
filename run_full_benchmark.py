@@ -930,10 +930,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     }
     
     all_results = []
-    
-    for ds_name in datasets:
-        if ds_name in {'abalone_19', 'Dry_Beans'}:
-            continue
 
         print(f"\n{'='*80}\n  DATASET: {ds_name}\n{'='*80}")
 
@@ -1194,6 +1190,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
