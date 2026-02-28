@@ -926,12 +926,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     from mat_diff.data_fetcher import load_dataset
     from mat_diff.manifold_diffusion import MATDiffPipeline
 
-    # Reuse evaluate_utility from the outer benchmark module
-    # (defined in mat_diff_full_benchmark.py)
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from mat_diff_full_benchmark import evaluate_utility
-
     print("\n" + "=" * 120)
     print("ABLATION STUDY: Train once per variant, evaluate 10 times")
     print("=" * 120)
@@ -1252,6 +1246,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
