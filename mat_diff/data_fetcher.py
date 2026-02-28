@@ -3,8 +3,10 @@ Automatic dataset download and preprocessing for all 33 benchmarks.
 
 Handles:
     - OpenML download via sklearn or openml package
+    - UCI download via ucimlrepo for datasets not on OpenML
     - Target column binarization for binary variants (abalone_19, etc.)
-    - Consistent preprocessing: imputation, encoding, QuantileTransform
+    - Missing value imputation (median for numeric, mode for categorical)
+    - Consistent preprocessing: QuantileTransform
     - Stratified train/test split
 """
 
@@ -16,6 +18,7 @@ from typing import Tuple, Dict, Optional
 from collections import Counter
 
 from sklearn.preprocessing import LabelEncoder, QuantileTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 
 from .config import DATASET_REGISTRY
@@ -23,6 +26,22 @@ from .config import DATASET_REGISTRY
 warnings.filterwarnings("ignore")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+
+def _clean_target_values(arr: np.ndarray) -> np.ndarray:
+    """Strip whitespace AND trailing punctuation (dots) from target values.
+
+    OpenML id=38 (thyroid sick) encodes targets as 'sick.' and 'negative.'
+    with trailing dots. Plain .strip() does not remove them.
+    """
+    cleaned = []
+    for v in arr:
+        s = str(v).strip()
+        # Strip trailing dots that appear in thyroid and similar datasets
+        s = s.rstrip(".")
+        s = s.strip()
+        cleaned.append(s)
+    return np.array(cleaned)
 
 
 def _download_openml(openml_id: int, dataset_name: str) -> pd.DataFrame:
@@ -50,13 +69,80 @@ def _download_openml(openml_id: int, dataset_name: str) -> pd.DataFrame:
         )
 
 
+def _download_uci(uci_id: int, dataset_name: str) -> pd.DataFrame:
+    """Download from UCI Machine Learning Repository via ucimlrepo package.
+
+    Used for datasets not correctly available on OpenML:
+        - Dry_Beans (UCI id=602): 13,611 samples, 7 classes
+    """
+    cache_path = os.path.join(DATA_DIR, f"{dataset_name}.csv")
+    if os.path.exists(cache_path):
+        df = pd.read_csv(cache_path)
+        # Validate: if cached file is wrong dataset (e.g., old 589-sample version), re-download
+        if dataset_name == "Dry_Beans" and len(df) < 10000:
+            print(f"    Cached {dataset_name} has only {len(df)} rows — re-downloading from UCI...")
+            os.remove(cache_path)
+        else:
+            return df
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    try:
+        from ucimlrepo import fetch_ucirepo
+        dataset = fetch_ucirepo(id=uci_id)
+        df = pd.concat([dataset.data.features, dataset.data.targets], axis=1)
+        df.to_csv(cache_path, index=False)
+        print(f"    Downloaded {dataset_name} from UCI (id={uci_id})")
+        return df
+    except ImportError:
+        raise RuntimeError(
+            f"ucimlrepo package required for {dataset_name}.\n"
+            f"Install: pip install ucimlrepo\n"
+            f"Then retry."
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot download {dataset_name} from UCI (id={uci_id}): {e}"
+        )
+
+
+def _impute_features(X_df: pd.DataFrame) -> pd.DataFrame:
+    """Impute missing values: median for numeric, mode for categorical.
+
+    CRITICAL: Use imputation instead of dropna() for datasets with many
+    missing values (e.g., thyroid_sick has ~30% missing per feature).
+    dropna() on thyroid_sick removes ~95% of rows, leaving an empty
+    dataset that causes 'list index out of range' in Counter().most_common().
+    """
+    result = X_df.copy()
+
+    numeric_cols = result.select_dtypes(include=np.number).columns.tolist()
+    cat_cols = result.select_dtypes(exclude=np.number).columns.tolist()
+
+    if numeric_cols:
+        num_imputer = SimpleImputer(strategy="median")
+        result[numeric_cols] = num_imputer.fit_transform(result[numeric_cols])
+
+    for col in cat_cols:
+        mode_val = result[col].mode()
+        if len(mode_val) > 0:
+            result[col] = result[col].fillna(mode_val.iloc[0])
+        else:
+            result[col] = result[col].fillna("missing")
+
+    return result
+
+
 def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = None) -> np.ndarray:
     """Convert multiclass targets to binary using the specified rule."""
-    y_str = np.array([str(v).strip() for v in y])
+    # Use _clean_target_values instead of plain str(v).strip() to handle
+    # trailing dots in thyroid_sick targets ("sick." → "sick")
+    y_str = _clean_target_values(y)
 
     if rule == "minority":
-        # Most common = 0, everything else = 1
         counts = Counter(y_str)
+        if len(counts) == 0:
+            raise ValueError("Empty target array — cannot apply minority rule.")
         majority = counts.most_common(1)[0][0]
         return (y_str != majority).astype(int)
 
@@ -64,12 +150,13 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
         val = rule[3:]
         binary = (y_str == val).astype(int)
         # If string match yields no positives, try numeric comparison
+        # This handles cases where int 19 becomes "19.0" via str()
         if binary.sum() == 0:
             try:
                 num_val = float(val)
                 y_num = pd.to_numeric(pd.Series(y_str), errors="coerce")
                 binary = (y_num == num_val).fillna(False).astype(int).values
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
         return binary
 
@@ -84,11 +171,9 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
         return (y_num >= threshold).astype(int)
 
     elif rule.startswith("pair_"):
-        # e.g., pair_0_5 → keep only classes 0 and 5
         parts = rule[5:].split("_")
         mask = np.isin(y_str, parts)
-        # Return the full mask and labels for filtering
-        return mask  # Caller must filter X too
+        return mask
 
     elif rule == "pair_AB":
         mask = np.isin(y_str, ["A", "B", "1", "2"])
@@ -110,47 +195,65 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     info = DATASET_REGISTRY[dataset_name]
     print(f"  Loading {dataset_name}...")
 
-    # Try local CSV first
+    # Determine source and load accordingly
+    source = info.get("source", "openml")
+
+    # Try local CSV first (respects both openml and uci cached files)
     local_path = os.path.join(DATA_DIR, f"{dataset_name}.csv")
-    if os.path.exists(local_path):
+
+    if source == "uci":
+        uci_id = info["uci_id"]
+        df = _download_uci(uci_id, dataset_name)
+    elif os.path.exists(local_path):
         df = pd.read_csv(local_path)
-        print(f"    Loaded from {local_path}")
+        # Validate cached file is not stale/wrong
+        if dataset_name == "Dry_Beans" and len(df) < 10000:
+            print(f"    Stale cache ({len(df)} rows) — re-downloading from UCI...")
+            os.remove(local_path)
+            df = _download_uci(info.get("uci_id", 602), dataset_name)
+        else:
+            print(f"    Loaded from {local_path}")
     else:
-        df = _download_openml(info["openml_id"], dataset_name)
+        openml_id = info["openml_id"]
+        df = _download_openml(openml_id, dataset_name)
 
-    # Clean
-    df = df.replace(["?", " ?", "NA", ""], np.nan)
-    df = df.dropna()
+    # Replace common missing value markers with NaN
+    df = df.replace(["?", " ?", "NA", "N/A", "nan", "NaN", ""], np.nan)
 
-    # Identify target
+    # Drop rows where TARGET is missing (only — features will be imputed)
     target_col = info.get("target", df.columns[-1])
     if target_col not in df.columns:
         target_col = df.columns[-1]
 
+    df = df.dropna(subset=[target_col])
+
     y_raw = df[target_col].values
     X_df = df.drop(columns=[target_col])
+
+    # Impute missing feature values (instead of dropping rows)
+    # CRITICAL for thyroid_sick which has ~30% missing per feature
+    X_df = _impute_features(X_df)
 
     # Apply minority rule
     rule = info.get("minority_rule", "minority")
     is_binary = info.get("binary", True)
 
-    if is_binary and rule.startswith("pair_"):
+    if is_binary and rule.startswith("pair_") and not rule.startswith("pair_AB"):
         mask = _apply_minority_rule(y_raw, rule)
         X_df = X_df[mask].reset_index(drop=True)
         y_raw = y_raw[mask]
-        y_str = np.array([str(v).strip() for v in y_raw])
+        y_str = _clean_target_values(y_raw)
         parts = rule[5:].split("_")
-        y = (y_str == parts[-1]).astype(int)  # Last part is minority
+        y = (y_str == parts[-1]).astype(int)
     elif is_binary:
         y = _apply_minority_rule(y_raw, rule)
     else:
         le = LabelEncoder()
-        y = le.fit_transform(np.array([str(v).strip() for v in y_raw]))
+        y = le.fit_transform(_clean_target_values(y_raw))
 
     # Validate that at least 2 classes with sufficient samples exist
     unique, counts = np.unique(y, return_counts=True)
     if len(unique) < 2 or counts.min() < 2:
-        # Fall back to majority vs. rest binarization
         y = _apply_minority_rule(y_raw, "minority")
         unique, counts = np.unique(y, return_counts=True)
         if len(unique) < 2 or counts.min() < 2:
@@ -159,32 +262,31 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
                 f"binarization — cannot form a valid train/test split."
             )
 
-    # Encode features
+    # Encode features: numeric as-is, categorical via LabelEncoder
     numeric_cols = X_df.select_dtypes(include=np.number).columns.tolist()
     cat_cols = X_df.select_dtypes(exclude=np.number).columns.tolist()
 
-    parts = []
+    parts_list = []
     if numeric_cols:
-        parts.append(X_df[numeric_cols].values.astype(float))
+        parts_list.append(X_df[numeric_cols].values.astype(float))
     for col in cat_cols:
         le = LabelEncoder()
-        parts.append(le.fit_transform(X_df[col].astype(str)).reshape(-1, 1).astype(float))
+        parts_list.append(le.fit_transform(X_df[col].astype(str)).reshape(-1, 1).astype(float))
 
-    if parts:
-        X = np.hstack(parts)
+    if parts_list:
+        X = np.hstack(parts_list)
     else:
         raise ValueError(f"No features found in {dataset_name}")
 
-    # Stratified split — fall back to random split if a class is too small
+    # Stratified split
     unique_y, counts_y = np.unique(y, return_counts=True)
     min_count = counts_y.min()
     n_test = max(1, int(len(y) * 0.2))
     min_samples_per_class_for_stratify = max(2, int(np.ceil(n_test / len(unique_y))))
-    has_minimum_samples = min_count >= 2
     can_stratify_split = min_count >= min_samples_per_class_for_stratify
-    use_stratify = has_minimum_samples and can_stratify_split
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=y if use_stratify else None
+        X, y, test_size=0.2, random_state=seed,
+        stratify=y if (min_count >= 2 and can_stratify_split) else None
     )
 
     # QuantileTransformer: maps to [0,1] — robust to outliers
