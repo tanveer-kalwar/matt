@@ -182,8 +182,14 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     # d_hidden: 4x d_model (standard transformer ratio)
     d_hidden = d_model * 4
 
-    # n_phases: Only use multiple phases if enough features to partition
-    if n_features >= 30 and spf >= 10:
+    # n_phases: Only use multiple phases if enough features to partition,
+    # enough samples per feature, AND enough minority samples to fit the
+    # spectral decomposition on. With < 50 minority samples, fitting PCA/SVD
+    # phases is fitting noise (19 samples → n_phases=1 mandatory).
+    minority_count_for_phases = max(10, int(n_samples / max(ir, 2)))
+    if minority_count_for_phases < 50:
+        n_phases = 1
+    elif n_features >= 30 and spf >= 10:
         n_phases = 3
     elif n_features >= 15 and spf >= 10:
         n_phases = 2
@@ -229,3 +235,4 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
