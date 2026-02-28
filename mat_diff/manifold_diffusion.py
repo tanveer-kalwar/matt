@@ -248,19 +248,6 @@ class MATDiffPipeline:
         # Clamp to [0, 1]
         curvature_per_sample = torch.clamp(curvature_per_sample, 0.0, 1.0)
 
-        # Precompute reference values needed for FIM-scaled Fisher weights
-        self._minority_ref_mean = X_minority.mean(axis=0)
-        fim_key_ref = int(minority_classes[0])
-        if fim_key_ref in self.fisher.fim_matrices:
-            fim_diag_ref = np.diag(self.fisher.fim_matrices[fim_key_ref]).clip(1e-10)
-            fim_diag_ref = fim_diag_ref / (fim_diag_ref.sum() + 1e-12) * self.n_features
-            fim_sqrt_ref = np.sqrt(fim_diag_ref)
-            dists_ref = np.array([float(np.dot(np.abs(x - self._minority_ref_mean), fim_sqrt_ref))
-                                  for x in X_minority])
-            self._fim_ref_scale = float(np.median(dists_ref)) + 1e-8
-        else:
-            self._fim_ref_scale = 1.0
-
         # If Fisher is disabled, also disable curvature (both come from FIM geometry)
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
@@ -271,34 +258,42 @@ class MATDiffPipeline:
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             weight_per_sample = torch.ones(len(y_minority), device=self.device)
         else:
-            # Fisher loss weights = FIM-scaled isolation score per sample.
-            # Isolated minority samples (high k-NN distance) represent rare
-            # subregions of the minority manifold — the model must learn these well.
-            # We scale the isolation by FIM diagonal so that isolation in
-            # INFORMATIVE feature directions gets higher weight than isolation
-            # in uninformative directions. This is the principled Fisher contribution.
+            # Fisher loss weights: boundary-proximity weighting.
+            # Minority samples CLOSEST to the majority centroid are boundary
+            # samples — hardest to classify, most valuable to generate correctly.
+            # FIM diagonal scales the distance by feature informativeness:
+            # distance in high-FIM dimensions matters more than low-FIM ones.
+            majority_class = max(cc.keys(), key=lambda c: cc[c])
+            X_majority_arr = X_train[y_train == majority_class]
+            maj_mean = X_majority_arr.mean(axis=0)
+
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
                 fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                fim_diag = fim_diag / (fim_diag.sum() + 1e-12) * self.n_features
+                fim_diag = fim_diag / (fim_diag.max() + 1e-12)  # normalize to [0,1]
             else:
                 fim_diag = np.ones(self.n_features)
 
-            # Reuse already-computed k-NN distances (curv_np = normalized distances)
-            # Scale by FIM: project each sample's displacement in FIM-weighted space
-            fim_sqrt = np.sqrt(fim_diag)
-            weights_np = np.ones(len(y_minority), dtype=np.float32)
-            for i, x in enumerate(X_minority):
-                # FIM-weighted distance to nearest neighbor
-                # curv_np[i] gives raw isolation, fim_sqrt scales by feature importance
-                nn_dist = curv_np[i]  # already normalized 0-1
-                # FIM-weighted feature variance at this sample
-                fim_score = float(np.dot(np.abs(x - self._minority_ref_mean), fim_sqrt))
-                fim_score = fim_score / (self._fim_ref_scale + 1e-8)
-                weights_np[i] = 1.0 + nn_dist * min(fim_score, 2.0)
+            # FIM-weighted distance from each minority sample to majority centroid
+            dists_to_maj = np.array([
+                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
+                for x in X_minority
+            ])
 
+            # Normalize distances to [0, 1]
+            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
+            if d_max > d_min:
+                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
+            else:
+                dists_norm = np.ones(len(y_minority)) * 0.5
+
+            # Closer to majority = lower dists_norm = higher weight
+            # Weight range: 1.0 (far from boundary) to 2.0 (on boundary)
+            weights_np = 2.0 - dists_norm
             weights_np = weights_np / (weights_np.mean() + 1e-12)
-            weight_per_sample = torch.tensor(weights_np, dtype=torch.float32, device=self.device)
+            weight_per_sample = torch.tensor(
+                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
+            )
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -603,6 +598,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
