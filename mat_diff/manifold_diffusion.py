@@ -459,6 +459,12 @@ class MATDiffPipeline:
             for c, cnt in class_counts.items():
                 deficit = max(0, int(majority_count - cnt))
                 if deficit > 0:
+                    # Cap over-generation for datasets with very few minority samples.
+                    # A diffusion model trained on < 50 samples cannot generalize to
+                    # generate 100x more samples — it produces memorization or noise.
+                    # Cap at 10x real minority count to preserve sample quality.
+                    if cnt < 50:
+                        deficit = min(deficit, int(cnt * 10))
                     n_per_class[int(c)] = deficit
 
         all_X, all_y = [], []
@@ -609,6 +615,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
