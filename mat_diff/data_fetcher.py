@@ -114,14 +114,19 @@ def _impute_features(X_df: pd.DataFrame) -> pd.DataFrame:
     dropna() on thyroid_sick removes ~95% of rows, leaving an empty
     dataset that causes 'list index out of range' in Counter().most_common().
     """
-    result = X_df.copy()
+    result = X_df.copy().reset_index(drop=True)
 
     numeric_cols = result.select_dtypes(include=np.number).columns.tolist()
     cat_cols = result.select_dtypes(exclude=np.number).columns.tolist()
 
     if numeric_cols:
         num_imputer = SimpleImputer(strategy="median")
-        result[numeric_cols] = num_imputer.fit_transform(result[numeric_cols])
+        imputed = num_imputer.fit_transform(result[numeric_cols])
+        # Use explicit DataFrame constructor to avoid index mismatch on assignment.
+        # Direct assignment result[cols] = numpy_array fails when index is
+        # non-contiguous (e.g., after dropna removed rows 1,3,5,...).
+        result[numeric_cols] = pd.DataFrame(imputed, columns=numeric_cols,
+                                            index=result.index)
 
     for col in cat_cols:
         mode_val = result[col].mode()
@@ -309,4 +314,5 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
 
