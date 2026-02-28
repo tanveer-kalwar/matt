@@ -181,11 +181,21 @@ class MATDiffPipeline:
         init_fim_tensor = torch.tensor(avg_fim, dtype=torch.float32, device=self.device)
 
         if init_fim_tensor.shape[0] != self.d_model:
-            # Padding FIM with approximate values creates a badly conditioned
-            # Mahalanobis metric. When n_features != d_model, the heads operating
-            # on padded dimensions get a wrong metric. Better to use identity
-            # (standard attention) and let the metric learn from data.
-            init_fim_tensor = None
+            # Project FIM into d_model space via top-d_model eigenvectors.
+            # This preserves the actual geometric structure from FIM rather
+            # than discarding it (None) or padding with zeros.
+            try:
+                eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
+                # Take top d_model eigenvectors (largest eigenvalues)
+                k = min(self.d_model, init_fim_tensor.shape[0])
+                top_vecs = eigvecs[:, -k:]  # (n_features, k)
+                top_vals = eigvals[-k:].clamp(min=1e-10)
+                # Reconstruct in d_model space
+                projected = torch.zeros(self.d_model, self.d_model, device=self.device)
+                projected[:k, :k] = torch.diag(top_vals)
+                init_fim_tensor = projected
+            except Exception:
+                init_fim_tensor = None
 
         dim_t = max(64, self.d_model // 2)
         use_geodesic = getattr(self, 'use_geodesic', True)
@@ -598,6 +608,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
