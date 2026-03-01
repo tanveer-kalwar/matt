@@ -1065,6 +1065,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 else:
                     X_aug, y_aug = X_tr, y_tr
 
+                X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=1.0, neginf=0.0)
                 clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
 
                 f1_avg  = np.mean([clf_results[cn]["F1"]  for cn in CLF_NAMES])
@@ -1257,6 +1258,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
