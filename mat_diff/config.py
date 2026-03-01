@@ -179,6 +179,21 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     if n_samples < 500:
         epochs = min(epochs, 800)
 
+    # Multiclass datasets with low IR have a large total-minority pool.
+    # Without a cap, Dry_Beans (n_classes=7) runs 721×72 = 51,912 steps.
+    # Mammography runs 931×13 = 12,103 steps. Dry_Beans is 4.3× SLOWER for
+    # a dataset that barely needs augmentation (IR=6.8).
+    # Fix: cap at TARGET_STEPS=8000 gradient steps total (min 200 epochs).
+    TARGET_STEPS = 8000
+    MIN_EPOCHS = 200
+    if n_classes > 2:
+        minority_total_estimate = int(n_samples * (n_classes - 1) / n_classes)
+    else:
+        minority_total_estimate = minority_estimate
+    batches_per_epoch_est = max(1, minority_total_estimate // batch_size)
+    epochs_from_budget = max(MIN_EPOCHS, TARGET_STEPS // batches_per_epoch_est)
+    epochs = min(epochs, epochs_from_budget)
+
     # d_hidden: 4x d_model (standard transformer ratio)
     d_hidden = d_model * 4
 
@@ -235,4 +250,5 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
