@@ -18,7 +18,6 @@ from typing import Tuple, Dict, Optional
 from collections import Counter
 
 from sklearn.preprocessing import LabelEncoder, QuantileTransformer
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 
 from .config import DATASET_REGISTRY
@@ -120,13 +119,15 @@ def _impute_features(X_df: pd.DataFrame) -> pd.DataFrame:
     cat_cols = result.select_dtypes(exclude=np.number).columns.tolist()
 
     if numeric_cols:
-        num_imputer = SimpleImputer(strategy="median")
-        imputed = num_imputer.fit_transform(result[numeric_cols])
-        # Use explicit DataFrame constructor to avoid index mismatch on assignment.
-        # Direct assignment result[cols] = numpy_array fails when index is
-        # non-contiguous (e.g., after dropna removed rows 1,3,5,...).
-        result[numeric_cols] = pd.DataFrame(imputed, columns=numeric_cols,
-                                            index=result.index)
+        # Column-by-column fillna — NEVER drops columns unlike SimpleImputer.
+        # SimpleImputer silently drops all-NaN columns: thyroid_sick has TBG
+        # column = 100% NaN, so 7 cols in → 6 cols out → shape mismatch crash.
+        # fillna() on a single Series always returns that same Series regardless
+        # of NaN proportion, so column count is always preserved.
+        for col in numeric_cols:
+            if result[col].isnull().any():
+                fill_val = result[col].median() if result[col].notna().any() else 0.0
+                result[col] = result[col].fillna(fill_val)
 
     for col in cat_cols:
         mode_val = result[col].mode()
@@ -314,5 +315,6 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
 
 
