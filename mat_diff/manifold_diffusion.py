@@ -552,8 +552,9 @@ class MATDiffPipeline:
                 # This directly fixes the feature distribution mismatch that hurts
                 # linear classifiers (LogisticRegression). Proven in distribution
                 # matching literature (MatchDG, Damodaran et al. 2018).
-                X_syn = (X_syn - syn_mean) / syn_std * real_std + real_mean
+                X_syn = (X_syn - syn_mean) / (syn_std + 1e-6) * real_std + real_mean
                 X_syn = np.clip(X_syn, 0.0, 1.0)
+                X_syn = np.nan_to_num(X_syn, nan=0.0, posinf=1.0, neginf=0.0)
 
                 # Step 2: k-NN quality filter — reject samples too far from
                 # any real minority sample (they're noise, not learned structure).
@@ -640,6 +641,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
