@@ -981,13 +981,22 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             use_geodesic = True
             n_phases = cfg["n_phases"]
 
+            use_fisher_weights = True
+            use_geodesic = True
+            use_spectral = True  
+            n_phases = cfg["n_phases"]
+
             if variant_name == "w/o Fisher":
                 use_fisher_weights = False
             elif variant_name == "w/o Geodesic":
                 use_geodesic = False
             elif variant_name == "w/o Spectral":
-                n_phases = 1
-            # MAT-Diff (Ours): all defaults
+                # DO NOT set n_phases=1. That is useless when the full model already
+                # derives n_phases=1 (wine_quality: 11 features, coil_2000: 19 minority).
+                # Result would be identical configs and score differences = pure noise.
+                # Correct ablation: use cosine schedule as the no-spectral baseline.
+                use_spectral = False
+            # MAT-Diff (Ours): use_spectral=True (spectral-fitted schedule)
 
             try:
                 pipeline = MATDiffPipeline(
@@ -1004,6 +1013,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 )
                 pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.use_geodesic = use_geodesic
+                pipeline.use_spectral = use_spectral
                 pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
                              batch_size=cfg["batch_size"], verbose=False)
 
@@ -1227,12 +1237,12 @@ def main():
         # If no datasets specified, use DGOT's 4 representative datasets
         if args.datasets is None:
             ablation_datasets = [
-                'wine_quality',    # Binary, high IR (25.77)
-                'bank',            # Binary, low IR (7.7)
-                'Dry_Beans',       # Multi-class, low IR (6.8)
-                'satimage'         # Multi-class, very low IR (2.5)
+                'mammography',   # Binary, IR=41.6,  minority_train≈210,  features=6
+                'wine_quality',  # Binary, IR=25.4,  minority_train≈197,  features=11
+                'thyroid_sick',  # Binary, IR=15.3,  minority_train≈220,  features=29
+                'letter_img',    # Binary, IR=26.0,  minority_train≈769,  features=16
             ]
-            print(f"No datasets specified, using DGOT's 4 representative datasets")
+            print("No datasets specified, using 4 representative ablation datasets")
         else:
             ablation_datasets = datasets
         
@@ -1247,6 +1257,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
