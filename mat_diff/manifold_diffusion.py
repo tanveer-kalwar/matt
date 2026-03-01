@@ -209,11 +209,20 @@ class MATDiffPipeline:
                 except Exception:
                     init_fim_tensor = None
             else:
-                # Project UP: n_features < d_model (INVALID — cannot add information).
-                # A 6x6 FIM padded into 64x64 with zeros creates a rank-6 matrix
-                # where 58 attention dimensions have zero metric → degenerate geometry.
-                # Use None so geodesic attention falls back to its learned initialization.
-                init_fim_tensor = None
+                n_feat = init_fim_tensor.shape[0]
+                try:
+                    eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
+                    eigvals = eigvals.clamp(min=1e-10)
+                    expanded = torch.zeros(self.d_model, self.d_model, device=self.device)
+                    for i in range(n_feat):
+                        v = eigvecs[:, i]
+                        reps = (self.d_model + n_feat - 1) // n_feat
+                        v_big = v.repeat(reps)[:self.d_model]
+                        v_big = v_big / (v_big.norm() + 1e-8)
+                        expanded += eigvals[i] * torch.outer(v_big, v_big)
+                    init_fim_tensor = expanded
+                except Exception:
+                    init_fim_tensor = None
 
         dim_t = max(64, self.d_model // 2)
         use_geodesic = getattr(self, 'use_geodesic', True)
@@ -316,8 +325,7 @@ class MATDiffPipeline:
                 dists_norm = np.ones(len(y_minority)) * 0.5
 
             # Closer to majority = lower dists_norm = higher weight
-            # Weight range: 1.0 (far from boundary) to 2.0 (on boundary)
-            weights_np = 2.0 - dists_norm
+            weights_np = 1.2 - dists_norm * 0.2
             weights_np = weights_np / (weights_np.mean() + 1e-12)
             weight_per_sample = torch.tensor(
                 weights_np.astype(np.float32), dtype=torch.float32, device=self.device
@@ -480,8 +488,8 @@ class MATDiffPipeline:
                     # A diffusion model trained on < 50 samples cannot generalize to
                     # generate 100x more samples — it produces memorization or noise.
                     # Cap at 10x real minority count to preserve sample quality.
-                    if cnt < 50:
-                        deficit = min(deficit, int(cnt * 10))
+                    if cnt < 1000:
+                        deficit = min(deficit, int(cnt * 5))
                     n_per_class[int(c)] = deficit
 
         all_X, all_y = [], []
@@ -632,6 +640,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
