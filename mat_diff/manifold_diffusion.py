@@ -52,6 +52,7 @@ class MATDiffPipeline:
         self.privacy_quantile = privacy_quantile
         self.use_fisher_weights = True
         self.use_geodesic = True
+        self.use_spectral = True
 
         self.fisher: Optional[FisherInformationEstimator] = None
         self.scheduler: Optional[SpectralCurriculumScheduler] = None
@@ -158,8 +159,24 @@ class MATDiffPipeline:
         self.scheduler = SpectralCurriculumScheduler(
             n_phases=self.n_phases, total_timesteps=self.total_timesteps
         )
-        self.scheduler.fit(X_minority)  # Spectrum of MINORITY data
-        beta_schedule = self.scheduler.get_full_beta_schedule()
+        self.scheduler.fit(X_minority)  # Always fit so sample_timesteps() works
+
+        if getattr(self, 'use_spectral', True):
+            # Full model: spectral-fitted multi-phase beta schedule.
+            beta_schedule = self.scheduler.get_full_beta_schedule()
+        else:
+            # w/o Spectral: standard cosine beta schedule (Nichol & Dhariwal 2021).
+            # This is the correct ablation baseline — tests spectral schedule vs
+            # a well-known alternative, meaningful on ALL datasets regardless of
+            # whether n_phases is 1 or 3 (n_phases=1 ablation is useless when the
+            # full model already uses n_phases=1 on low-feature-count datasets).
+            import numpy as _np
+            _t = _np.arange(self.total_timesteps + 1) / self.total_timesteps
+            _s = 0.008  # offset from Nichol & Dhariwal 2021
+            _alphas_bar = _np.cos((_t + _s) / (1 + _s) * _np.pi / 2) ** 2
+            _alphas_bar = _alphas_bar / _alphas_bar[0]
+            beta_schedule = _np.clip(1.0 - _alphas_bar[1:] / _alphas_bar[:-1], 1e-4, 0.999)
+
         self._setup_diffusion(beta_schedule)
 
         if verbose:
@@ -615,6 +632,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
