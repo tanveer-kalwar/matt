@@ -1017,6 +1017,8 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
                              batch_size=cfg["batch_size"], verbose=False)
 
+                torch.manual_seed({'w/o Fisher': 1001, 'w/o Geodesic': 1002,
+                                   'w/o Spectral': 1003, 'MAT-Diff (Ours)': 1004}.get(variant_name, 1000))
                 X_syn_raw, y_syn_raw = pipeline.sample()
                 trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
                 print("✓")
@@ -1238,10 +1240,10 @@ def main():
         # If no datasets specified, use DGOT's 4 representative datasets
         if args.datasets is None:
             ablation_datasets = [
-                'mammography',   # Binary, IR=41.6,  minority_train≈210,  features=6
-                'wine_quality',  # Binary, IR=25.4,  minority_train≈197,  features=11
-                'thyroid_sick',  # Binary, IR=15.3,  minority_train≈220,  features=29
-                'letter_img',    # Binary, IR=26.0,  minority_train≈769,  features=16
+                'mammography',
+                'wine_quality', 
+                'thyroid_sick',  
+                'bankruptcy',   
             ]
             print("No datasets specified, using 4 representative ablation datasets")
         else:
@@ -1258,6 +1260,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
