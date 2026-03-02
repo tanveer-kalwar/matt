@@ -312,7 +312,8 @@ class MATDiffPipeline:
                 dists_norm = np.ones(len(y_minority)) * 0.5
 
             # Closer to majority = lower dists_norm = higher weight
-            weights_np = 1.2 - dists_norm * 0.2
+            # Weight range: 1.0 (far from boundary) to 2.0 (on boundary)
+            weights_np = 2.0 - dists_norm
             weights_np = weights_np / (weights_np.mean() + 1e-12)
             weight_per_sample = torch.tensor(
                 weights_np.astype(np.float32), dtype=torch.float32, device=self.device
@@ -628,6 +629,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
