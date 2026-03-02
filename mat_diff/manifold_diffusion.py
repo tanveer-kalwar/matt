@@ -209,20 +209,7 @@ class MATDiffPipeline:
                 except Exception:
                     init_fim_tensor = None
             else:
-                n_feat = init_fim_tensor.shape[0]
-                try:
-                    eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
-                    eigvals = eigvals.clamp(min=1e-10)
-                    expanded = torch.zeros(self.d_model, self.d_model, device=self.device)
-                    for i in range(n_feat):
-                        v = eigvecs[:, i]
-                        reps = (self.d_model + n_feat - 1) // n_feat
-                        v_big = v.repeat(reps)[:self.d_model]
-                        v_big = v_big / (v_big.norm() + 1e-8)
-                        expanded += eigvals[i] * torch.outer(v_big, v_big)
-                    init_fim_tensor = expanded
-                except Exception:
-                    init_fim_tensor = None
+                init_fim_tensor = None
 
         dim_t = max(64, self.d_model // 2)
         use_geodesic = getattr(self, 'use_geodesic', True)
@@ -641,6 +628,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
