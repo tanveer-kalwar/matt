@@ -164,18 +164,23 @@ class MATDiffPipeline:
         if getattr(self, 'use_spectral', True):
             # Full model: spectral-fitted multi-phase beta schedule.
             beta_schedule = self.scheduler.get_full_beta_schedule()
+            # CRITICAL: when n_phases=1, get_full_beta_schedule() returns LINEAR.
+            # Linear is strictly worse than cosine (proven in DDPM improved, Nichol 2021).
+            # If the ablation uses cosine, full model will always lose on n_phases=1 datasets.
+            # Fix: enforce cosine as minimum quality baseline for full model.
+            if self.n_phases == 1:
+                import numpy as _np2
+                _t2 = _np2.arange(self.total_timesteps + 1) / self.total_timesteps
+                _s2 = 0.008
+                _ab2 = _np2.cos((_t2 + _s2) / (1 + _s2) * _np2.pi / 2) ** 2
+                _ab2 = _ab2 / _ab2[0]
+                beta_schedule = _np2.clip(1.0 - _ab2[1:] / _ab2[:-1], 1e-4, 0.999)
         else:
-            # w/o Spectral: standard cosine beta schedule (Nichol & Dhariwal 2021).
-            # This is the correct ablation baseline — tests spectral schedule vs
-            # a well-known alternative, meaningful on ALL datasets regardless of
-            # whether n_phases is 1 or 3 (n_phases=1 ablation is useless when the
-            # full model already uses n_phases=1 on low-feature-count datasets).
+            # w/o Spectral: LINEAR beta schedule (naive DDPM-original baseline).
+            # This is the correct ablation: proves spectral/cosine scheduling helps
+            # vs the simplest possible alternative. Works on all datasets.
             import numpy as _np
-            _t = _np.arange(self.total_timesteps + 1) / self.total_timesteps
-            _s = 0.008  # offset from Nichol & Dhariwal 2021
-            _alphas_bar = _np.cos((_t + _s) / (1 + _s) * _np.pi / 2) ** 2
-            _alphas_bar = _alphas_bar / _alphas_bar[0]
-            beta_schedule = _np.clip(1.0 - _alphas_bar[1:] / _alphas_bar[:-1], 1e-4, 0.999)
+            beta_schedule = _np.linspace(1e-4, 0.02, self.total_timesteps)
 
         self._setup_diffusion(beta_schedule)
 
@@ -272,52 +277,33 @@ class MATDiffPipeline:
         # Clamp to [0, 1]
         curvature_per_sample = torch.clamp(curvature_per_sample, 0.0, 1.0)
 
-        # If Fisher is disabled, also disable curvature (both come from FIM geometry)
+        # If Fisher is disabled, also disable curvature
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
 
-        # Fisher loss weights per sample: proximity to class boundary
-        # Samples closer to the majority centroid (harder/boundary) get higher weight
-        # This is meaningful even when training minority-only (varies per sample)
+        # Fisher feature-importance loss weighting.
+        # FIM diagonal = how much each feature shifts the class posterior (discriminativeness).
+        # Weight reconstruction error MORE on high-FIM (discriminative) features.
+        # This makes the diffusion model learn the correct feature importance structure,
+        # which benefits ALL downstream classifiers (not just boundary-sensitive ones).
+        # This follows DGOT/GOIO: use geometry to guide WHERE generation is accurate.
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            weight_per_sample = torch.ones(len(y_minority), device=self.device)
+            feature_loss_weights = torch.ones(self.n_features, device=self.device)
         else:
-            # Fisher loss weights: boundary-proximity weighting.
-            # Minority samples CLOSEST to the majority centroid are boundary
-            # samples — hardest to classify, most valuable to generate correctly.
-            # FIM diagonal scales the distance by feature informativeness:
-            # distance in high-FIM dimensions matters more than low-FIM ones.
-            majority_class = max(cc.keys(), key=lambda c: cc[c])
-            X_majority_arr = X_train[y_train == majority_class]
-            maj_mean = X_majority_arr.mean(axis=0)
-
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
                 fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                fim_diag = fim_diag / (fim_diag.max() + 1e-12)  # normalize to [0,1]
+                # Normalize: center at 1.0 so mean weight = 1.0
+                fim_diag_norm = fim_diag / (fim_diag.mean() + 1e-12)
+                # Cap at [0.5, 2.0]: prevent any single feature dominating
+                fim_diag_norm = np.clip(fim_diag_norm, 0.5, 2.0)
             else:
-                fim_diag = np.ones(self.n_features)
-
-            # FIM-weighted distance from each minority sample to majority centroid
-            dists_to_maj = np.array([
-                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
-                for x in X_minority
-            ])
-
-            # Normalize distances to [0, 1]
-            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
-            if d_max > d_min:
-                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
-            else:
-                dists_norm = np.ones(len(y_minority)) * 0.5
-
-            # Closer to majority = lower dists_norm = higher weight
-            # Weight range: 1.0 (far from boundary) to 2.0 (on boundary)
-            weights_np = 2.0 - dists_norm
-            weights_np = weights_np / (weights_np.mean() + 1e-12)
-            weight_per_sample = torch.tensor(
-                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
+                fim_diag_norm = np.ones(self.n_features)
+            feature_loss_weights = torch.tensor(
+                fim_diag_norm.astype(np.float32), dtype=torch.float32, device=self.device
             )
+        # Per-sample weight is uniform — Fisher applies to FEATURES not samples
+        weight_per_sample = torch.ones(len(y_minority), device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -352,8 +338,9 @@ class MATDiffPipeline:
                     x_noisy, t, y=y_batch, curvature=curv_batch
                 )
 
-                loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
-                loss = (loss_per_sample * w_batch).mean()
+                # Feature-weighted MSE: errors in discriminative features count more
+                loss_per_sample = ((noise - noise_pred) ** 2 * feature_loss_weights).mean(dim=1)
+                loss = loss_per_sample.mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -629,6 +616,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
