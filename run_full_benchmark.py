@@ -1242,8 +1242,8 @@ def main():
             ablation_datasets = [
                 'mammography',
                 'wine_quality', 
-                'thyroid_sick',  
-                'bankruptcy',   
+                'coil_2000',  
+                'taiwanese',   
             ]
             print("No datasets specified, using 4 representative ablation datasets")
         else:
@@ -1260,6 +1260,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
