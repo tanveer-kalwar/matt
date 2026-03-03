@@ -477,7 +477,7 @@ class MATDiffPipeline:
         x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt + sigma * noise
 
         return x_prev
-        def sample(self, n_per_class=None):
+    def sample(self, n_per_class=None):
         """Generate synthetic minority samples using hybrid approach.
         
         For small minority classes (<300 samples): Use diffusion-guided 
@@ -679,6 +679,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
