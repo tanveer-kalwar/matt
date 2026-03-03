@@ -113,19 +113,13 @@ class SpectralCurriculumScheduler:
         """Per-phase cosine beta schedules derived from spectral energy.
 
         Uses DDPM bounds [1e-4, 0.02] modulated by energy fraction.
-        If n_phases == 1, uses COSINE schedule (proven better than linear,
-        Nichol & Dhariwal ICML 2021). The ablation should use LINEAR.
+        If n_phases == 1, uses standard linear schedule (proper ablation).
         """
         self.beta_schedules = []
         
         if self.n_phases <= 1:
-            # COSINE schedule for single-phase (proven superior to linear)
-            # This ensures full model always has good baseline schedule
-            t = np.arange(self.total_timesteps + 1) / self.total_timesteps
-            s = 0.008  # offset from Nichol & Dhariwal
-            alpha_bar = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
-            alpha_bar = alpha_bar / alpha_bar[0]
-            betas = np.clip(1.0 - alpha_bar[1:] / alpha_bar[:-1], 1e-4, 0.999)
+            # Standard DDPM linear schedule — no spectral modulation
+            betas = np.linspace(BETA_MIN_DDPM, BETA_MAX_DDPM, self.total_timesteps)
             self.beta_schedules = [betas]
             return
         
@@ -138,7 +132,6 @@ class SpectralCurriculumScheduler:
             max_beta = BETA_MAX_DDPM * (1.0 - efrac * 0.5)
             min_beta = BETA_MIN_DDPM * (1.0 + efrac)
 
-            # Cosine schedule within this phase
             steps = np.linspace(0, 1, n_steps)
             betas = min_beta + 0.5 * (max_beta - min_beta) * (1 - np.cos(np.pi * steps))
             self.beta_schedules.append(betas)
@@ -190,6 +183,7 @@ class SpectralCurriculumScheduler:
             t = torch.cat([t_phase, t_full])
             t = t[torch.randperm(len(t), device=device)]
             return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
