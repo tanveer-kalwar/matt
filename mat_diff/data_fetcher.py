@@ -190,11 +190,31 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
 
 
 def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load, preprocess, and split a dataset.
-
-    Returns:
-        (X_train, y_train, X_test, y_test) — all numpy arrays, features normalized to [0,1]
-    """
+    """Load dataset with sklearn fallback for common datasets."""
+    
+    # Sklearn fallback for optical_digits (OpenML id=28 often fails)
+    if dataset_name == "optical_digits":
+        try:
+            from sklearn.datasets import load_digits
+            from sklearn.preprocessing import QuantileTransformer
+            from sklearn.model_selection import train_test_split as tts
+            
+            digits = load_digits()
+            X, y = digits.data, digits.target
+            
+            # Apply minority rule: class 8 is minority
+            y_binary = (y == 8).astype(int)
+            
+            scaler = QuantileTransformer(output_distribution="uniform", random_state=seed)
+            X_scaled = scaler.fit_transform(X)
+            
+            X_tr, X_te, y_tr, y_te = tts(X_scaled, y_binary, test_size=0.2, 
+                                          random_state=seed, stratify=y_binary)
+            print(f"    Loaded optical_digits from sklearn (fallback)")
+            return X_tr, y_tr, X_te, y_te
+        except Exception as e:
+            print(f"    sklearn fallback failed: {e}")
+            
     if dataset_name not in DATASET_REGISTRY:
         raise KeyError(f"Unknown dataset: {dataset_name}. Available: {list(DATASET_REGISTRY.keys())}")
 
@@ -315,6 +335,7 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
 
 
 
