@@ -224,6 +224,29 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
         
         return X_tr, y_tr, X_te, y_te
 
+    # Handle optical_digits specially using sklearn's built-in dataset
+    # because OpenML id=28 frequently fails
+    if dataset_name == "optical_digits":
+        from sklearn.datasets import load_digits
+        from sklearn.model_selection import train_test_split as sklearn_split
+        
+        digits = load_digits()
+        X, y = digits.data, digits.target
+        y_binary = (y == 8).astype(int)
+        scaler = QuantileTransformer(output_distribution="uniform", random_state=seed)
+        X_scaled = scaler.fit_transform(X)
+        X_tr, X_te, y_tr, y_te = sklearn_split(
+            X_scaled, y_binary, test_size=0.2, random_state=seed, stratify=y_binary
+        )
+        dist = dict(zip(*np.unique(y_tr, return_counts=True)))
+        ir = max(dist.values()) / max(1, min(dist.values()))
+        print(f"    Loaded optical_digits from sklearn (fallback)")
+        print(f"    Samples: {len(X_tr)} train, {len(X_te)} test")
+        print(f"    Features: {X_tr.shape[1]}, Classes: {len(dist)}, IR: {ir:.1f}")
+        print(f"    Distribution: {dist}")
+        return X_tr, y_tr, X_te, y_te
+
+
     if dataset_name not in DATASET_REGISTRY:
         raise KeyError(f"Unknown dataset: {dataset_name}. Available: {list(DATASET_REGISTRY.keys())}")
 
@@ -344,6 +367,7 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
 
 
 
