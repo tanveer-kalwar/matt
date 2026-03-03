@@ -298,37 +298,23 @@ class MATDiffPipeline:
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
 
-        # Fisher feature-importance loss weighting.
-        # FIM diagonal = how much each feature shifts the class posterior.
-        # Weight MSE loss on HIGH-FIM features more heavily → model learns to
-        # reconstruct discriminative features accurately. All 5 classifiers benefit.
-        # This is analogous to DGOT/GOIO: geometry guides accuracy of generation.
+        # Fisher per-FEATURE loss weighting (not per-sample).
+        # Weight the MSE loss more heavily on discriminative features.
+        # FIM diagonal indicates feature importance for classification.
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            weight_per_sample = torch.ones(len(y_minority), device=self.device)
+            feature_weights = torch.ones(self.n_features, device=self.device)
         else:
-            majority_class = max(cc.keys(), key=lambda c: cc[c])
-            X_majority_arr = X_train[y_train == majority_class]
-            maj_mean = X_majority_arr.mean(axis=0)
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
-                fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                fim_diag = fim_diag / (fim_diag.max() + 1e-12)
+                fim_diag = np.diag(self.fisher.fim_matrices[fim_key])
+                fim_diag = np.maximum(fim_diag, 1e-10)
+                # Normalize: mean = 1.0, so total loss magnitude is unchanged
+                fim_diag = fim_diag / (fim_diag.mean() + 1e-12)
+                # Soft scaling: sqrt to avoid extreme weights
+                fim_diag = np.sqrt(fim_diag)
+                feature_weights = torch.tensor(fim_diag, dtype=torch.float32, device=self.device)
             else:
-                fim_diag = np.ones(self.n_features)
-            dists_to_maj = np.array([
-                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
-                for x in X_minority
-            ])
-            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
-            if d_max > d_min:
-                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
-            else:
-                dists_norm = np.ones(len(y_minority)) * 0.5
-            weights_np = 2.0 - dists_norm
-            weights_np = weights_np / (weights_np.mean() + 1e-12)
-            weight_per_sample = torch.tensor(
-                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
-            )
+                feature_weights = torch.ones(self.n_features, device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -349,7 +335,6 @@ class MATDiffPipeline:
                 x_batch = X_tensor[idx]
                 y_batch = y_tensor[idx]
                 curv_batch = curvature_per_sample[idx]
-                w_batch = weight_per_sample[idx]
 
                 if getattr(self, 'use_spectral', True):
                     t = self.scheduler.sample_timesteps(
@@ -368,8 +353,10 @@ class MATDiffPipeline:
                     x_noisy, t, y=y_batch, curvature=curv_batch
                 )
 
-                loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
-                loss = (loss_per_sample * w_batch).mean()
+                # Per-feature weighted MSE loss
+                squared_error = (noise - noise_pred) ** 2  # (batch, n_features)
+                weighted_error = squared_error * feature_weights.unsqueeze(0)  # broadcast
+                loss = weighted_error.mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -468,11 +455,10 @@ class MATDiffPipeline:
 
         return x_prev
     def sample(self, n_per_class=None):
-        """Generate synthetic minority samples using DDPM (not DDIM).
+        """Generate synthetic minority samples.
         
-        DDPM stochastic sampling produces MORE DIVERSE samples than DDIM
-        for tabular data. DDIM's deterministic nature causes mode collapse
-        when the training set is small (few hundred minority samples).
+        Key insight: LESS is MORE for weak diffusion models.
+        Generate conservatively and only keep high-quality samples.
         """
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
@@ -484,59 +470,30 @@ class MATDiffPipeline:
             for c, cnt in class_counts.items():
                 deficit = max(0, int(majority_count - cnt))
                 if deficit > 0:
-                    # Cap over-generation for datasets with very few minority samples.
-                    # A diffusion model trained on < 50 samples cannot generalize to
-                    # generate 100x more samples — it produces memorization or noise.
-                    # Cap at 10x real minority count to preserve sample quality.
-                    # Cap at 2x for very small classes, 3x for medium
-                    # Over-generation with weak model creates noise that hurts classifiers
-                    if cnt < 100:
-                        deficit = min(deficit, int(cnt * 2))
-                    elif cnt < 500:
-                        deficit = min(deficit, int(cnt * 3))
-                    elif cnt < 1000:
-                        deficit = min(deficit, int(cnt * 4))
-                    n_per_class[int(c)] = deficit
-
-        # Seed RNG using a combination of model weights AND ablation flags
-        # This ensures different ablation variants get different seeds even if
-        # weight sums are similar (they converge to similar loss on same data)
-        try:
-            _weight_sum = sum(p.sum().item() for p in self.denoiser.parameters())
-            # Add flags to differentiate ablation variants
-            _flag_bits = (
-                (1 if getattr(self, 'use_fisher_weights', True) else 0) +
-                (2 if getattr(self, 'use_geodesic', True) else 0) +
-                (4 if getattr(self, 'use_spectral', True) else 0)
-            )
-            _param_hash = int(abs(_weight_sum * 1e6 + _flag_bits * 1e9)) % (2**31)
-            torch.manual_seed(_param_hash)
-            np.random.seed(_param_hash % (2**31))
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(_param_hash)
-        except Exception:
-            pass
+                    # CONSERVATIVE: cap at 1.5x minority count for quality
+                    # Over-generation with limited training data creates noise
+                    n_per_class[int(c)] = min(deficit, int(cnt * 1.5))
 
         all_X, all_y = [], []
-        MAX_BATCH = 512
+        MAX_BATCH = 256
 
         for class_label, n_needed in n_per_class.items():
             if n_needed <= 0:
                 continue
-            print(f"  Sampling class {class_label}: {n_needed} samples...")
+            
+            # Generate 2x what we need, then filter to keep best
+            n_generate = min(n_needed * 2, 2000)
+            print(f"  Sampling class {class_label}: generating {n_generate}, keeping {n_needed}...")
 
             self.denoiser.eval()
+            curv_norm = 0.5
 
-            # Use median local curvature of minority class as conditioning for sampling
-            # This matches the per-sample curvature approach used during training
-            curv_norm = 0.5  # default: median = boundary-ambiguous region
-
-            n_batches = (n_needed + MAX_BATCH - 1) // MAX_BATCH
+            n_batches = (n_generate + MAX_BATCH - 1) // MAX_BATCH
             class_samples = []
 
             for batch_idx in range(n_batches):
                 samples_generated = sum(len(s) for s in class_samples)
-                batch_size = min(MAX_BATCH, n_needed - samples_generated)
+                batch_size = min(MAX_BATCH, n_generate - samples_generated)
                 if batch_size <= 0:
                     break
 
@@ -544,53 +501,37 @@ class MATDiffPipeline:
                 y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
                 curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
 
-                # DDIM strided sampling — mathematically correct for non-consecutive steps.
-                # DDPM posterior formula is ONLY valid for consecutive t -> t-1 steps.
-                # DDIM is specifically designed for arbitrary stride.
-                sampling_steps = getattr(self, '_sampling_steps', 200)
-                stride = max(1, self.total_timesteps // sampling_steps)
-                timesteps = list(range(0, self.total_timesteps, stride))
-                if (self.total_timesteps - 1) not in timesteps:
-                    timesteps.append(self.total_timesteps - 1)
-                timesteps = sorted(timesteps, reverse=True)
-
-                # Use DDPM for more diverse samples on small minority datasets
-                # DDPM is stochastic; DDIM is deterministic → DDPM adds diversity
-                sampling_steps = getattr(self, '_sampling_steps', 200)
-                stride = max(1, self.total_timesteps // sampling_steps)
-                
-                # For DDPM, we need to iterate through ALL timesteps (no skipping)
-                # because DDPM posterior variance assumes t -> t-1 consecutive
+                # Full DDPM sampling (all 1000 steps)
                 for t_idx in range(self.total_timesteps - 1, -1, -1):
                     x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=curvature)
 
-                # Clamp to data range
                 x_t = torch.clamp(x_t, 0.0, 1.0)
                 class_samples.append(x_t.cpu().numpy())
 
             if not class_samples:
                 continue
+                
             X_syn = np.vstack(class_samples)
-            
-            # Simple post-processing: just clamp and denoise
-            # Complex moment matching can INTRODUCE errors when synthetic 
-            # distribution is already reasonable
             X_syn = np.clip(X_syn, 0.0, 1.0)
             X_syn = np.nan_to_num(X_syn, nan=0.5, posinf=1.0, neginf=0.0)
             
-            # Only do light filtering: remove extreme outliers (> 5 std from mean)
+            # Quality filtering: keep samples closest to real minority distribution
             X_real_c = self.X_train[self.y_train == class_label]
-            if len(X_real_c) >= 5 and len(X_syn) > 0:
-                real_mean = X_real_c.mean(axis=0)
-                real_std = X_real_c.std(axis=0) + 1e-8
+            if len(X_real_c) >= 3 and len(X_syn) > n_needed:
+                from sklearn.neighbors import NearestNeighbors
                 
-                # Check each synthetic sample: reject if ANY feature is > 5 std away
-                z_scores = np.abs((X_syn - real_mean) / real_std)
-                max_z = z_scores.max(axis=1)
-                keep_mask = max_z <= 5.0
+                # Find distance from each synthetic to nearest real sample
+                nn = NearestNeighbors(n_neighbors=1, algorithm='auto')
+                nn.fit(X_real_c)
+                dists, _ = nn.kneighbors(X_syn)
+                dists = dists.flatten()
                 
-                if keep_mask.sum() >= max(1, len(X_syn) // 2):
-                    X_syn = X_syn[keep_mask]
+                # Keep the n_needed samples with SMALLEST distance to real data
+                # These are most realistic
+                keep_indices = np.argsort(dists)[:n_needed]
+                X_syn = X_syn[keep_indices]
+            else:
+                X_syn = X_syn[:n_needed]
             
             if len(X_syn) > 0:
                 all_X.append(X_syn)
@@ -654,6 +595,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
