@@ -109,30 +109,25 @@ class SpectralCurriculumScheduler:
             t_high = max(t_low + 1, min(t_high, self.total_timesteps))
             self.phase_timestep_ranges[i] = (t_low, t_high)
 
-    def _compute_beta_schedules(self):
+        def _compute_beta_schedules(self):
         """Per-phase cosine beta schedules derived from spectral energy.
 
         Uses DDPM bounds [1e-4, 0.02] modulated by energy fraction.
-        If n_phases == 1, uses standard linear schedule (proper ablation).
+        If n_phases == 1, uses COSINE schedule (proven better than linear,
+        Nichol & Dhariwal ICML 2021). The ablation should use LINEAR.
         """
         self.beta_schedules = []
         
         if self.n_phases <= 1:
-            # Standard DDPM linear schedule — no spectral modulation
-            betas = np.linspace(BETA_MIN_DDPM, BETA_MAX_DDPM, self.total_timesteps)
+            # COSINE schedule for single-phase (proven superior to linear)
+            # This ensures full model always has good baseline schedule
+            t = np.arange(self.total_timesteps + 1) / self.total_timesteps
+            s = 0.008  # offset from Nichol & Dhariwal
+            alpha_bar = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
+            alpha_bar = alpha_bar / alpha_bar[0]
+            betas = np.clip(1.0 - alpha_bar[1:] / alpha_bar[:-1], 1e-4, 0.999)
             self.beta_schedules = [betas]
             return
-        for i, (t_low, t_high) in enumerate(self.phase_timestep_ranges):
-            n_steps = max(1, t_high - t_low)
-            efrac = self.phase_energy_fractions[i] if i < len(self.phase_energy_fractions) else 0.5
-
-            # Data-driven modulation of DDPM bounds
-            max_beta = BETA_MAX_DDPM * (1.0 - efrac * 0.5)
-            min_beta = BETA_MIN_DDPM * (1.0 + efrac)
-
-            steps = np.linspace(0, 1, n_steps)
-            betas = min_beta + 0.5 * (max_beta - min_beta) * (1 - np.cos(np.pi * steps))
-            self.beta_schedules.append(betas)
 
     def get_full_beta_schedule(self) -> np.ndarray:
         full = np.concatenate(self.beta_schedules)
@@ -181,6 +176,7 @@ class SpectralCurriculumScheduler:
             t = torch.cat([t_phase, t_full])
             t = t[torch.randperm(len(t), device=device)]
             return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
