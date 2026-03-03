@@ -145,7 +145,11 @@ class MATDiffPipeline:
         loss_weights = self.fisher.get_loss_weights()
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             loss_weights = {c: 1.0 for c in loss_weights}
-        curvature_tensor = self.fisher.get_curvature_tensor(self.device)
+            # Also disable curvature conditioning when Fisher is disabled
+            # (curvature is derived from FIM, so they are coupled)
+            curvature_tensor = torch.ones(self.n_classes, device=self.device) * 0.5
+        else:
+            curvature_tensor = self.fisher.get_curvature_tensor(self.device)
 
         if verbose:
             for c in sorted(self.fisher.curvatures.keys()):
@@ -661,6 +665,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
