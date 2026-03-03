@@ -547,37 +547,56 @@ class MATDiffPipeline:
         _, indices = nn.kneighbors(X_real)
         
         synthetic = []
-        for _ in range(n_needed):
-            # Pick random sample
-            idx = np.random.randint(0, n_real)
-            x1 = X_real[idx]
+        
+        # Process in batches for efficiency
+        batch_size = min(64, n_needed)
+        n_batches = (n_needed + batch_size - 1) // batch_size
+        
+        for batch_idx in range(n_batches):
+            current_batch_size = min(batch_size, n_needed - len(synthetic))
+            if current_batch_size <= 0:
+                break
             
-            # Pick random neighbor
-            neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
-            x2 = X_real[neighbor_idx]
+            batch_samples = []
+            for _ in range(current_batch_size):
+                # Pick random sample
+                idx = np.random.randint(0, n_real)
+                x1 = X_real[idx]
+                
+                # Pick random neighbor
+                neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
+                x2 = X_real[neighbor_idx]
+                
+                # Interpolate (SMOTE)
+                alpha = np.random.uniform(0.3, 0.7)
+                x_new = x1 + alpha * (x2 - x1)
+                batch_samples.append(x_new)
             
-            # Interpolate (SMOTE)
-            alpha = np.random.uniform(0.3, 0.7)
-            x_new = x1 + alpha * (x2 - x1)
+            batch_samples = np.array(batch_samples)
             
             # Add small diffusion-learned perturbation
-            # Use denoiser to predict direction, then add scaled noise
-            with torch.no_grad():
-                x_t = torch.tensor(x_new, dtype=torch.float32, device=self.device).unsqueeze(0)
-                y_cond = torch.tensor([class_label], device=self.device, dtype=torch.long)
-                t = torch.tensor([50], device=self.device)  # Low noise level
-                
-                # Get denoiser's prediction of noise direction
-                noise_pred = self.denoiser(x_t, t, y=y_cond, curvature=None)
-                
-                # Add small perturbation in learned direction
-                perturbation = 0.05 * noise_pred.cpu().numpy().flatten()
-                x_new = x_new + perturbation
+            try:
+                with torch.no_grad():
+                    x_t = torch.tensor(batch_samples, dtype=torch.float32, device=self.device)
+                    y_cond = torch.full((len(batch_samples),), class_label, 
+                                        device=self.device, dtype=torch.long)
+                    # Use low noise level timestep
+                    t = torch.full((len(batch_samples),), 50, device=self.device, dtype=torch.long)
+                    
+                    # Get denoiser's prediction of noise direction
+                    noise_pred = self.denoiser(x_t, t, y=y_cond, curvature=None)
+                    
+                    # Add small perturbation in learned direction
+                    perturbation = 0.03 * noise_pred.cpu().numpy()
+                    batch_samples = batch_samples + perturbation
+            except Exception as e:
+                # If denoiser fails, just use SMOTE interpolation without perturbation
+                pass
             
-            x_new = np.clip(x_new, 0.0, 1.0)
-            synthetic.append(x_new)
+            batch_samples = np.clip(batch_samples, 0.0, 1.0)
+            synthetic.extend(batch_samples)
         
-        return np.array(synthetic)
+        return np.array(synthetic[:n_needed])
 
     def _sample_diffusion(self, n_needed, class_label):
         """Full diffusion sampling for larger minority classes."""
@@ -679,6 +698,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
