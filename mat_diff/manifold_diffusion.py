@@ -287,19 +287,31 @@ class MATDiffPipeline:
         # reconstruct discriminative features accurately. All 5 classifiers benefit.
         # This is analogous to DGOT/GOIO: geometry guides accuracy of generation.
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            feature_loss_weights = torch.ones(self.n_features, device=self.device)
+            weight_per_sample = torch.ones(len(y_minority), device=self.device)
         else:
+            majority_class = max(cc.keys(), key=lambda c: cc[c])
+            X_majority_arr = X_train[y_train == majority_class]
+            maj_mean = X_majority_arr.mean(axis=0)
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
                 fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                fim_diag_norm = fim_diag / (fim_diag.mean() + 1e-12)
-                fim_diag_norm = np.clip(fim_diag_norm, 0.5, 2.0)  # cap: no single feature dominates
+                fim_diag = fim_diag / (fim_diag.max() + 1e-12)
             else:
-                fim_diag_norm = np.ones(self.n_features)
-            feature_loss_weights = torch.tensor(
-                fim_diag_norm.astype(np.float32), dtype=torch.float32, device=self.device
+                fim_diag = np.ones(self.n_features)
+            dists_to_maj = np.array([
+                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
+                for x in X_minority
+            ])
+            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
+            if d_max > d_min:
+                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
+            else:
+                dists_norm = np.ones(len(y_minority)) * 0.5
+            weights_np = 2.0 - dists_norm
+            weights_np = weights_np / (weights_np.mean() + 1e-12)
+            weight_per_sample = torch.tensor(
+                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
             )
-        weight_per_sample = torch.ones(len(y_minority), device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -322,9 +334,14 @@ class MATDiffPipeline:
                 curv_batch = curvature_per_sample[idx]
                 w_batch = weight_per_sample[idx]
 
-                t = self.scheduler.sample_timesteps(
-                    len(x_batch), epoch, epochs, self.device
-                )
+                if getattr(self, 'use_spectral', True):
+                    t = self.scheduler.sample_timesteps(
+                        len(x_batch), epoch, epochs, self.device
+                    )
+                else:
+                    t = torch.randint(
+                        0, self.total_timesteps, (len(x_batch),), device=self.device
+                    )
                 t = torch.clamp(t, 0, self.total_timesteps - 1)
 
                 noise = torch.randn_like(x_batch)
@@ -623,6 +640,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
