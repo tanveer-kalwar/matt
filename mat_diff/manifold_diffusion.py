@@ -281,29 +281,39 @@ class MATDiffPipeline:
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
 
-        # Fisher feature-importance loss weighting.
-        # FIM diagonal = how much each feature shifts the class posterior (discriminativeness).
-        # Weight reconstruction error MORE on high-FIM (discriminative) features.
-        # This makes the diffusion model learn the correct feature importance structure,
-        # which benefits ALL downstream classifiers (not just boundary-sensitive ones).
-        # This follows DGOT/GOIO: use geometry to guide WHERE generation is accurate.
+        # Fisher loss weights: boundary-proximity sample weighting.
+        # Minority samples closest to majority centroid = hardest boundary samples.
+        # Weight these more in loss so model learns boundary region accurately.
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            feature_loss_weights = torch.ones(self.n_features, device=self.device)
+            weight_per_sample = torch.ones(len(y_minority), device=self.device)
         else:
+            majority_class = max(cc.keys(), key=lambda c: cc[c])
+            X_majority_arr = X_train[y_train == majority_class]
+            maj_mean = X_majority_arr.mean(axis=0)
+
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
                 fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                # Normalize: center at 1.0 so mean weight = 1.0
-                fim_diag_norm = fim_diag / (fim_diag.mean() + 1e-12)
-                # Cap at [0.5, 2.0]: prevent any single feature dominating
-                fim_diag_norm = np.clip(fim_diag_norm, 0.5, 2.0)
+                fim_diag = fim_diag / (fim_diag.max() + 1e-12)
             else:
-                fim_diag_norm = np.ones(self.n_features)
-            feature_loss_weights = torch.tensor(
-                fim_diag_norm.astype(np.float32), dtype=torch.float32, device=self.device
+                fim_diag = np.ones(self.n_features)
+
+            dists_to_maj = np.array([
+                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
+                for x in X_minority
+            ])
+            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
+            if d_max > d_min:
+                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
+            else:
+                dists_norm = np.ones(len(y_minority)) * 0.5
+
+            weights_np = 2.0 - dists_norm
+            weights_np = weights_np / (weights_np.mean() + 1e-12)
+            weight_per_sample = torch.tensor(
+                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
             )
-        # Per-sample weight is uniform — Fisher applies to FEATURES not samples
-        weight_per_sample = torch.ones(len(y_minority), device=self.device)
+        feature_loss_weights = torch.ones(self.n_features, device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -338,9 +348,8 @@ class MATDiffPipeline:
                     x_noisy, t, y=y_batch, curvature=curv_batch
                 )
 
-                # Feature-weighted MSE: errors in discriminative features count more
-                loss_per_sample = ((noise - noise_pred) ** 2 * feature_loss_weights).mean(dim=1)
-                loss = loss_per_sample.mean()
+                loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
+                loss = (loss_per_sample * w_batch).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -616,6 +625,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
