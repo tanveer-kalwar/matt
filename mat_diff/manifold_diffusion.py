@@ -488,8 +488,14 @@ class MATDiffPipeline:
                     # A diffusion model trained on < 50 samples cannot generalize to
                     # generate 100x more samples — it produces memorization or noise.
                     # Cap at 10x real minority count to preserve sample quality.
-                    if cnt < 1000:
-                        deficit = min(deficit, int(cnt * 5))
+                    # Cap at 2x for very small classes, 3x for medium
+                    # Over-generation with weak model creates noise that hurts classifiers
+                    if cnt < 100:
+                        deficit = min(deficit, int(cnt * 2))
+                    elif cnt < 500:
+                        deficit = min(deficit, int(cnt * 3))
+                    elif cnt < 1000:
+                        deficit = min(deficit, int(cnt * 4))
                     n_per_class[int(c)] = deficit
 
         # Seed RNG using a combination of model weights AND ablation flags
@@ -562,50 +568,33 @@ class MATDiffPipeline:
                 x_t = torch.clamp(x_t, 0.0, 1.0)
                 class_samples.append(x_t.cpu().numpy())
 
+            if not class_samples:
+                continue
             X_syn = np.vstack(class_samples)
             
-            # Post-processing: moment matching + k-NN quality filter
+            # Simple post-processing: just clamp and denoise
+            # Complex moment matching can INTRODUCE errors when synthetic 
+            # distribution is already reasonable
+            X_syn = np.clip(X_syn, 0.0, 1.0)
+            X_syn = np.nan_to_num(X_syn, nan=0.5, posinf=1.0, neginf=0.0)
+            
+            # Only do light filtering: remove extreme outliers (> 5 std from mean)
             X_real_c = self.X_train[self.y_train == class_label]
-            if len(X_real_c) >= 5:
+            if len(X_real_c) >= 5 and len(X_syn) > 0:
                 real_mean = X_real_c.mean(axis=0)
                 real_std = X_real_c.std(axis=0) + 1e-8
-                syn_mean = X_syn.mean(axis=0)
-                syn_std = X_syn.std(axis=0) + 1e-8
-
-                # Step 1: Moment matching — standardize to real minority statistics.
-                # This directly fixes the feature distribution mismatch that hurts
-                # linear classifiers (LogisticRegression). Proven in distribution
-                # matching literature (MatchDG, Damodaran et al. 2018).
-                X_syn = (X_syn - syn_mean) / (syn_std + 1e-6) * real_std + real_mean
-                X_syn = np.clip(X_syn, 0.0, 1.0)
-                X_syn = np.nan_to_num(X_syn, nan=0.0, posinf=1.0, neginf=0.0)
                 
-                # Step 2: k-NN quality filter — reject samples too far from
-                # any real minority sample (they're noise, not learned structure).
-                # Keep samples within 3x median nearest-neighbor distance.
-                from sklearn.neighbors import NearestNeighbors as _NNQ
-                try:
-                    k_q = min(3, len(X_real_c) - 1)
-                    if k_q >= 1:
-                        _nn_q = _NNQ(n_neighbors=k_q, algorithm='auto')
-                        _nn_q.fit(X_real_c)
-                        dists_syn, _ = _nn_q.kneighbors(X_syn)
-                        dists_real, _ = _nn_q.kneighbors(X_real_c)
-                        median_real_dist = np.median(dists_real[:, 0]) + 1e-8
-                        threshold = median_real_dist * 4.0
-                        keep_mask = dists_syn[:, 0] <= threshold
-                        if keep_mask.sum() >= len(X_syn) * 0.3:
-                            X_syn = X_syn[keep_mask]
-                        # If too few kept, fall back to closest n_needed samples
-                        elif len(X_syn) > 0:
-                            order = np.argsort(dists_syn[:, 0])
-                            keep_n = max(int(len(X_syn) * 0.5), 1)
-                            X_syn = X_syn[order[:keep_n]]
-                except Exception:
-                    pass
+                # Check each synthetic sample: reject if ANY feature is > 5 std away
+                z_scores = np.abs((X_syn - real_mean) / real_std)
+                max_z = z_scores.max(axis=1)
+                keep_mask = max_z <= 5.0
+                
+                if keep_mask.sum() >= max(1, len(X_syn) // 2):
+                    X_syn = X_syn[keep_mask]
             
-            all_X.append(X_syn)
-            all_y.append(np.full(len(X_syn), class_label))
+            if len(X_syn) > 0:
+                all_X.append(X_syn)
+                all_y.append(np.full(len(X_syn), class_label))
 
         if not all_X:
             return np.empty((0, self.n_features)), np.empty(0, dtype=int)
@@ -665,6 +654,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
