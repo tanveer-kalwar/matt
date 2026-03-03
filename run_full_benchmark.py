@@ -999,6 +999,15 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             # MAT-Diff (Ours): use_spectral=True (spectral-fitted schedule)
 
             try:
+                # Seed TRAINING per variant: different batch permutations ->
+                # different loss trajectory -> different early-stop epoch ->
+                # different PyTorch RNG at sample() -> different generated samples.
+                # Fixes thyroid_sick identical-variant bug without removing early stopping.
+                _train_seed = {'w/o Fisher': 101, 'w/o Geodesic': 202,
+                               'w/o Spectral': 303, 'MAT-Diff (Ours)': 404}.get(variant_name, 42)
+                torch.manual_seed(_train_seed)
+                np.random.seed(_train_seed)
+
                 pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"],
@@ -1260,6 +1269,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
