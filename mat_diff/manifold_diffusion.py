@@ -492,11 +492,13 @@ class MATDiffPipeline:
         x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt + sigma * noise
 
         return x_prev
-    def sample(self, n_per_class=None):
-        """Generate synthetic minority samples.
+        def sample(self, n_per_class=None):
+        """Generate synthetic minority samples using hybrid approach.
         
-        Key insight: LESS is MORE for weak diffusion models.
-        Generate conservatively and only keep high-quality samples.
+        For small minority classes (<300 samples): Use diffusion-guided 
+        interpolation (SMOTE-style but with diffusion-learned directions).
+        
+        For larger classes: Use full diffusion sampling with quality filter.
         """
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
@@ -508,72 +510,29 @@ class MATDiffPipeline:
             for c, cnt in class_counts.items():
                 deficit = max(0, int(majority_count - cnt))
                 if deficit > 0:
-                    # CONSERVATIVE: cap at 1.5x minority count for quality
-                    # Over-generation with limited training data creates noise
-                    n_per_class[int(c)] = min(deficit, int(cnt * 1.5))
+                    # Conservative cap
+                    n_per_class[int(c)] = min(deficit, int(cnt * 2))
 
         all_X, all_y = [], []
-        MAX_BATCH = 256
 
         for class_label, n_needed in n_per_class.items():
             if n_needed <= 0:
                 continue
-            
-            # Generate 2x what we need, then filter to keep best
-            n_generate = min(n_needed * 2, 2000)
-            print(f"  Sampling class {class_label}: generating {n_generate}, keeping {n_needed}...")
 
-            self.denoiser.eval()
-            curv_norm = 0.5
-
-            n_batches = (n_generate + MAX_BATCH - 1) // MAX_BATCH
-            class_samples = []
-
-            for batch_idx in range(n_batches):
-                samples_generated = sum(len(s) for s in class_samples)
-                batch_size = min(MAX_BATCH, n_generate - samples_generated)
-                if batch_size <= 0:
-                    break
-
-                x_t = torch.randn(batch_size, self.n_features, device=self.device)
-                y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
-                curvature = torch.full((batch_size,), curv_norm, device=self.device, dtype=torch.float32)
-
-                # Full DDPM sampling (all 1000 steps)
-                for t_idx in range(self.total_timesteps - 1, -1, -1):
-                    x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=curvature)
-
-                x_t = torch.clamp(x_t, 0.0, 1.0)
-                class_samples.append(x_t.cpu().numpy())
-
-            if not class_samples:
-                continue
-                
-            X_syn = np.vstack(class_samples)
-            X_syn = np.clip(X_syn, 0.0, 1.0)
-            X_syn = np.nan_to_num(X_syn, nan=0.5, posinf=1.0, neginf=0.0)
-            
-            # Quality filtering: keep samples that look most like real minority
             X_real_c = self.X_train[self.y_train == class_label]
-            if len(X_real_c) >= 10 and len(X_syn) > n_needed:
-                from sklearn.ensemble import RandomForestClassifier
-                
-                # Train a quick discriminator: real (1) vs synthetic (0)
-                X_disc = np.vstack([X_real_c, X_syn])
-                y_disc = np.array([1] * len(X_real_c) + [0] * len(X_syn))
-                
-                disc = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-                disc.fit(X_disc, y_disc)
-                
-                # Get probability of each synthetic being "real"
-                probs_real = disc.predict_proba(X_syn)[:, 1]
-                
-                # Keep top n_needed by "realness" probability
-                keep_indices = np.argsort(probs_real)[-n_needed:]
-                X_syn = X_syn[keep_indices]
-            else:
-                X_syn = X_syn[:n_needed]
+            n_real = len(X_real_c)
             
+            print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
+
+            # HYBRID STRATEGY based on minority size
+            if n_real < 300:
+                # Small minority: Use diffusion-guided interpolation
+                # This preserves real data structure while adding diversity
+                X_syn = self._sample_interpolation(X_real_c, n_needed, class_label)
+            else:
+                # Larger minority: Full diffusion sampling
+                X_syn = self._sample_diffusion(n_needed, class_label)
+
             if len(X_syn) > 0:
                 all_X.append(X_syn)
                 all_y.append(np.full(len(X_syn), class_label))
@@ -582,6 +541,105 @@ class MATDiffPipeline:
             return np.empty((0, self.n_features)), np.empty(0, dtype=int)
 
         return np.vstack(all_X), np.concatenate(all_y)
+
+    def _sample_interpolation(self, X_real, n_needed, class_label):
+        """Diffusion-guided interpolation (hybrid SMOTE + diffusion).
+        
+        1. Pick random pairs from real minority
+        2. Interpolate between them (SMOTE-style)
+        3. Add small diffusion-learned perturbation for diversity
+        """
+        from sklearn.neighbors import NearestNeighbors
+        
+        n_real = len(X_real)
+        k = min(5, n_real - 1)
+        if k < 1:
+            return X_real.copy()
+        
+        # Find k nearest neighbors for each sample
+        nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
+        nn.fit(X_real)
+        _, indices = nn.kneighbors(X_real)
+        
+        synthetic = []
+        for _ in range(n_needed):
+            # Pick random sample
+            idx = np.random.randint(0, n_real)
+            x1 = X_real[idx]
+            
+            # Pick random neighbor
+            neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
+            x2 = X_real[neighbor_idx]
+            
+            # Interpolate (SMOTE)
+            alpha = np.random.uniform(0.3, 0.7)
+            x_new = x1 + alpha * (x2 - x1)
+            
+            # Add small diffusion-learned perturbation
+            # Use denoiser to predict direction, then add scaled noise
+            with torch.no_grad():
+                x_t = torch.tensor(x_new, dtype=torch.float32, device=self.device).unsqueeze(0)
+                y_cond = torch.tensor([class_label], device=self.device, dtype=torch.long)
+                t = torch.tensor([50], device=self.device)  # Low noise level
+                
+                # Get denoiser's prediction of noise direction
+                noise_pred = self.denoiser(x_t, t, y=y_cond, curvature=None)
+                
+                # Add small perturbation in learned direction
+                perturbation = 0.05 * noise_pred.cpu().numpy().flatten()
+                x_new = x_new + perturbation
+            
+            x_new = np.clip(x_new, 0.0, 1.0)
+            synthetic.append(x_new)
+        
+        return np.array(synthetic)
+
+    def _sample_diffusion(self, n_needed, class_label):
+        """Full diffusion sampling for larger minority classes."""
+        self.denoiser.eval()
+        
+        n_generate = min(n_needed * 2, 2000)
+        MAX_BATCH = 256
+        
+        n_batches = (n_generate + MAX_BATCH - 1) // MAX_BATCH
+        class_samples = []
+
+        for batch_idx in range(n_batches):
+            samples_generated = sum(len(s) for s in class_samples)
+            batch_size = min(MAX_BATCH, n_generate - samples_generated)
+            if batch_size <= 0:
+                break
+
+            x_t = torch.randn(batch_size, self.n_features, device=self.device)
+            y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
+
+            # Full DDPM sampling
+            for t_idx in range(self.total_timesteps - 1, -1, -1):
+                x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=None, 
+                                          guidance_scale=1.5)
+
+            x_t = torch.clamp(x_t, 0.0, 1.0)
+            class_samples.append(x_t.cpu().numpy())
+
+        if not class_samples:
+            return np.empty((0, self.n_features))
+            
+        X_syn = np.vstack(class_samples)
+        X_syn = np.clip(X_syn, 0.0, 1.0)
+        
+        # Quality filter: keep samples closest to real
+        X_real_c = self.X_train[self.y_train == class_label]
+        if len(X_real_c) >= 5 and len(X_syn) > n_needed:
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=1, algorithm='auto')
+            nn.fit(X_real_c)
+            dists, _ = nn.kneighbors(X_syn)
+            keep_indices = np.argsort(dists.flatten())[:n_needed]
+            X_syn = X_syn[keep_indices]
+        else:
+            X_syn = X_syn[:n_needed]
+        
+        return X_syn
 
     def save(self, path: str):
         import os
@@ -636,6 +694,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
