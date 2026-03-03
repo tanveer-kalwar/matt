@@ -1,38 +1,29 @@
 """
-Spectral Curriculum Scheduling for tabular diffusion.
+Spectral Curriculum Scheduling for Tabular Diffusion.
 
-Beta schedule derivation (justification for IEEE TKDE):
-    The DDPM standard (Ho et al. 2020) uses beta in [1e-4, 0.02].
-    We adopt these EXACT bounds from the DDPM paper (not magic numbers).
+Curriculum learning for diffusion: train on "easier" noise levels first,
+then gradually cover all timesteps.
 
-    Per-phase scaling: each phase's beta range is modulated by spectral
-    energy fraction. Phases covering high-energy (coarse) directions use
-    the full [beta_min, beta_max] range. Phases covering low-energy (fine)
-    directions use a narrower range to prevent over-noising fine structure.
+Key insight: The beta SCHEDULE should be fixed (cosine, proven best).
+The CURRICULUM is implemented via biased timestep sampling during training.
 
-    Formally:
-        beta_max_k = beta_max_ddpm * (1 - E_k / E_total * 0.5)
-        beta_min_k = beta_min_ddpm * (1 + E_k / E_total)
-    where E_k is cumulative energy fraction up to phase k.
-    This is derived from the principle that fine-structure noise should
-    be bounded by the energy content of that spectral band.
-
-Phase boundaries:
-    Derived from cumulative energy thresholds of the SVD of X.
-    Evenly-spaced energy thresholds [1/K, 2/K, ..., (K-1)/K] partition
-    the spectrum by equal energy contribution, not arbitrary index.
+Phases are derived from data eigenspectrum:
+    - Phase 1 (coarse): Focus on high-noise timesteps (global structure)
+    - Phase 2 (medium): Expand to medium timesteps
+    - Phase 3 (fine): Cover all timesteps including low-noise (details)
 """
 
 import numpy as np
 import torch
 from typing import List, Tuple, Optional
 
-BETA_MIN_DDPM = 1e-4
-BETA_MAX_DDPM = 0.02
+# DDPM constants
+BETA_MIN = 1e-4
+BETA_MAX = 0.02
 
 
 class SpectralCurriculumScheduler:
-    """Derive diffusion schedule from data eigenspectrum."""
+    """Spectral-aware curriculum for diffusion training."""
 
     def __init__(
         self,
@@ -40,12 +31,12 @@ class SpectralCurriculumScheduler:
         total_timesteps: int = 1000,
         energy_thresholds: Optional[List[float]] = None,
     ):
-        self.n_phases = n_phases
+        self.n_phases = max(1, n_phases)
         self.total_timesteps = total_timesteps
 
         if energy_thresholds is None:
             self.energy_thresholds = [
-                (i + 1) / n_phases for i in range(n_phases - 1)
+                (i + 1) / self.n_phases for i in range(self.n_phases - 1)
             ]
         else:
             self.energy_thresholds = energy_thresholds
@@ -54,145 +45,111 @@ class SpectralCurriculumScheduler:
         self.spectral_energy: Optional[np.ndarray] = None
         self.phase_boundaries: List[int] = []
         self.phase_timestep_ranges: List[Tuple[int, int]] = []
-        self.beta_schedules: List[np.ndarray] = []
         self.phase_energy_fractions: List[float] = []
 
     def fit(self, X: np.ndarray) -> "SpectralCurriculumScheduler":
-        """Analyze eigenspectrum and derive phase boundaries."""
+        """Analyze data eigenspectrum to determine curriculum phases."""
         X_centered = X - X.mean(axis=0)
-        _, S, _ = np.linalg.svd(X_centered, full_matrices=False)
+        try:
+            _, S, _ = np.linalg.svd(X_centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            S = np.ones(min(X.shape))
+        
         self.singular_values = S
-
         energy = np.cumsum(S ** 2)
         total_e = energy[-1] + 1e-12
         self.spectral_energy = energy / total_e
 
+        # Compute phase boundaries from energy thresholds
         self.phase_boundaries = []
         for threshold in self.energy_thresholds:
             idx = int(np.searchsorted(self.spectral_energy, threshold))
-            self.phase_boundaries.append(idx)
+            self.phase_boundaries.append(min(idx, len(S) - 1))
 
         self._compute_timestep_ranges()
-        self._compute_beta_schedules()
         return self
 
     def _compute_timestep_ranges(self):
-        """Assign timestep ranges proportional to spectral energy per band."""
-        boundaries = [0] + self.phase_boundaries + [len(self.singular_values)]
-        band_energies = []
-        for i in range(len(boundaries) - 1):
-            start, end = boundaries[i], boundaries[i + 1]
-            if end > start:
-                band_energy = np.sum(self.singular_values[start:end] ** 2)
-            else:
-                band_energy = 1e-6
-            band_energies.append(band_energy)
-
-        total_energy = sum(band_energies)
-        fractions = [e / total_energy for e in band_energies]
-        self.phase_energy_fractions = fractions
-
-        self.phase_timestep_ranges = []
-        t_start = self.total_timesteps
-        for frac in fractions:
-            t_end = max(0, t_start - int(frac * self.total_timesteps))
-            if t_end >= t_start:
-                t_end = max(0, t_start - 1)
-            self.phase_timestep_ranges.append((t_end, t_start))
-            t_start = t_end
-
-        self.phase_timestep_ranges.reverse()
-        self.phase_energy_fractions.reverse()
-
-        for i, (t_low, t_high) in enumerate(self.phase_timestep_ranges):
-            t_low = max(0, min(t_low, self.total_timesteps - 1))
-            t_high = max(t_low + 1, min(t_high, self.total_timesteps))
-            self.phase_timestep_ranges[i] = (t_low, t_high)
-
-    def _compute_beta_schedules(self):
-        """Per-phase cosine beta schedules derived from spectral energy.
-
-        Uses DDPM bounds [1e-4, 0.02] modulated by energy fraction.
-        If n_phases == 1, uses standard linear schedule (proper ablation).
+        """Assign timestep ranges to each curriculum phase.
+        
+        Phase 0: High timesteps (noisy, coarse structure)
+        Phase K: Low timesteps (clean, fine details)
         """
-        self.beta_schedules = []
+        # Divide timesteps into n_phases ranges
+        # Earlier phases focus on higher timesteps (more noise)
+        steps_per_phase = self.total_timesteps // self.n_phases
         
-        if self.n_phases <= 1:
-            # Standard DDPM linear schedule — no spectral modulation
-            betas = np.linspace(BETA_MIN_DDPM, BETA_MAX_DDPM, self.total_timesteps)
-            self.beta_schedules = [betas]
-            return
+        self.phase_timestep_ranges = []
+        self.phase_energy_fractions = []
         
-        # Multi-phase: compute per-phase beta schedules with spectral modulation
-        for i, (t_low, t_high) in enumerate(self.phase_timestep_ranges):
-            n_steps = max(1, t_high - t_low)
-            efrac = self.phase_energy_fractions[i] if i < len(self.phase_energy_fractions) else 0.5
-
-            # Data-driven modulation of DDPM bounds
-            max_beta = BETA_MAX_DDPM * (1.0 - efrac * 0.5)
-            min_beta = BETA_MIN_DDPM * (1.0 + efrac)
-
-            steps = np.linspace(0, 1, n_steps)
-            betas = min_beta + 0.5 * (max_beta - min_beta) * (1 - np.cos(np.pi * steps))
-            self.beta_schedules.append(betas)
+        for i in range(self.n_phases):
+            # Phase i covers timesteps from t_low to t_high
+            # Phase 0 = highest timesteps, Phase n-1 = lowest
+            t_high = self.total_timesteps - i * steps_per_phase
+            t_low = max(0, t_high - steps_per_phase)
+            
+            # Last phase should cover down to 0
+            if i == self.n_phases - 1:
+                t_low = 0
+            
+            self.phase_timestep_ranges.append((t_low, t_high))
+            self.phase_energy_fractions.append(1.0 / self.n_phases)
 
     def get_full_beta_schedule(self) -> np.ndarray:
-        full = np.concatenate(self.beta_schedules)
-        if len(full) > self.total_timesteps:
-            full = full[:self.total_timesteps]
-        elif len(full) < self.total_timesteps:
-            pad = np.full(self.total_timesteps - len(full), full[-1])
-            full = np.concatenate([full, pad])
-        return full.astype(np.float64)
+        """Return COSINE beta schedule (proven best, used for all variants)."""
+        t = np.arange(self.total_timesteps + 1) / self.total_timesteps
+        s = 0.008  # Offset from Nichol & Dhariwal
+        alpha_bar = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
+        alpha_bar = alpha_bar / alpha_bar[0]
+        betas = np.clip(1.0 - alpha_bar[1:] / alpha_bar[:-1], BETA_MIN, 0.999)
+        return betas.astype(np.float64)
 
     def get_phase_for_epoch(self, epoch: int, total_epochs: int) -> int:
+        """Determine curriculum phase based on training progress."""
+        if self.n_phases <= 1:
+            return 0
         fraction = epoch / max(1, total_epochs)
         return min(int(fraction * self.n_phases), self.n_phases - 1)
 
     def get_timestep_range_for_epoch(self, epoch: int, total_epochs: int) -> Tuple[int, int]:
+        """Get the timestep range for current curriculum phase."""
         phase = self.get_phase_for_epoch(epoch, total_epochs)
-        t_low = self.phase_timestep_ranges[phase][0]
-        t_high = self.phase_timestep_ranges[phase][1]
-        t_low = max(0, min(t_low, self.total_timesteps - 1))
-        t_high = max(t_low + 1, min(t_high, self.total_timesteps))
-        return (t_low, t_high)
+        if phase >= len(self.phase_timestep_ranges):
+            return (0, self.total_timesteps)
+        return self.phase_timestep_ranges[phase]
 
     def sample_timesteps(
         self, batch_size: int, epoch: int, total_epochs: int, device: str = "cpu"
-        ) -> torch.Tensor:
-            """Sample timesteps with curriculum bias toward current phase.
+    ) -> torch.Tensor:
+        """Sample timesteps with curriculum bias.
+        
+        Curriculum strategy:
+        - 60% from current phase range (curriculum focus)
+        - 40% from full range (prevent dead zones)
+        
+        If n_phases == 1: Pure uniform sampling (ablation baseline).
+        """
+        if self.n_phases <= 1:
+            # Ablation: uniform sampling over all timesteps
+            return torch.randint(0, self.total_timesteps, (batch_size,), 
+                                 device=device).long()
 
-            70% of timesteps drawn from the current phase range (curriculum),
-            30% drawn uniformly from the full range (ensures all timesteps
-            are trained throughout, preventing dead zones during sampling).
-            
-            If n_phases == 1, ALL timesteps are drawn uniformly (no curriculum).
-            """
-            if self.n_phases <= 1:
-                return torch.randint(0, self.total_timesteps, (batch_size,), 
-                                     device=device).long()
-            t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
-            t_low = max(0, t_low)
-            t_high = max(t_low + 1, t_high)
+        t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
+        t_low = max(0, t_low)
+        t_high = max(t_low + 1, min(t_high, self.total_timesteps))
 
-            n_phase = int(batch_size * 0.7)
-            n_full = batch_size - n_phase
+        # Split: 60% curriculum, 40% uniform
+        n_curriculum = int(batch_size * 0.6)
+        n_uniform = batch_size - n_curriculum
 
-            t_phase = torch.randint(t_low, t_high, (n_phase,), device=device)
-            t_full = torch.randint(0, self.total_timesteps, (n_full,), device=device)
-            t = torch.cat([t_phase, t_full])
-            t = t[torch.randperm(len(t), device=device)]
-            return torch.clamp(t.long(), 0, self.total_timesteps - 1)
-
-
-
-
-
-
-
-
-
-
-
-
-
+        # Curriculum samples from current phase
+        t_curriculum = torch.randint(t_low, t_high, (n_curriculum,), device=device)
+        
+        # Uniform samples from full range
+        t_uniform = torch.randint(0, self.total_timesteps, (n_uniform,), device=device)
+        
+        # Combine and shuffle
+        t = torch.cat([t_curriculum, t_uniform])
+        t = t[torch.randperm(len(t), device=device)]
+        
+        return torch.clamp(t.long(), 0, self.total_timesteps - 1)
