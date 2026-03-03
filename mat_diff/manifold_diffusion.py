@@ -316,13 +316,26 @@ class MATDiffPipeline:
             else:
                 feature_weights = torch.ones(self.n_features, device=self.device)
 
+        # Compute per-feature importance weights from FIM
+        # FIM diagonal = Fisher Information for each feature = discriminativeness
+        fim_feature_weights = torch.ones(self.n_features, device=self.device)
+        if getattr(self, 'use_fisher_weights', True):
+            for c in minority_classes:
+                if int(c) in self.fisher.fim_matrices:
+                    fim = self.fisher.fim_matrices[int(c)]
+                    fim_diag = np.diag(fim).clip(1e-10)
+                    # Normalize to mean=1 so total loss magnitude unchanged
+                    fim_diag = fim_diag / (fim_diag.mean() + 1e-12)
+                    # Soft scaling with sqrt to prevent extreme weights
+                    fim_diag = np.sqrt(fim_diag)
+                    fim_feature_weights = torch.tensor(fim_diag, dtype=torch.float32, device=self.device)
+                    break  # Use first minority class FIM
+
         self.denoiser.train()
         best_loss = float('inf')
-        # Patience scales with minority size: small datasets need more patience
-        # because loss oscillates more with small batches
-        minority_size = len(X_minority)
-        patience = max(120, min(200, minority_size // 2))
+        patience = max(100, min(150, len(X_minority) // 3))
         patience_counter = 0
+        best_state = None
 
         for epoch in range(epochs):
             perm = torch.randperm(len(X_tensor), device=self.device)
@@ -336,6 +349,7 @@ class MATDiffPipeline:
                 y_batch = y_tensor[idx]
                 curv_batch = curvature_per_sample[idx]
 
+                # Timestep sampling: curriculum if spectral enabled, else uniform
                 if getattr(self, 'use_spectral', True):
                     t = self.scheduler.sample_timesteps(
                         len(x_batch), epoch, epochs, self.device
@@ -353,16 +367,20 @@ class MATDiffPipeline:
                     x_noisy, t, y=y_batch, curvature=curv_batch
                 )
 
-                # Per-feature weighted MSE loss
-                squared_error = (noise - noise_pred) ** 2  # (batch, n_features)
-                weighted_error = squared_error * feature_weights.unsqueeze(0)  # broadcast
-                loss = weighted_error.mean()
+                # FIM-weighted per-feature MSE loss
+                squared_error = (noise - noise_pred) ** 2  # (B, n_features)
+                if getattr(self, 'use_fisher_weights', True):
+                    weighted_error = squared_error * fim_feature_weights.unsqueeze(0)
+                    loss = weighted_error.mean()
+                else:
+                    loss = squared_error.mean()
 
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.denoiser.parameters(), max_norm=1.0)
                 optimizer.step()
 
+                # EMA update
                 with torch.no_grad():
                     for p_ema, p_model in zip(ema_denoiser.parameters(), self.denoiser.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_model.data, alpha=1.0 - ema_decay)
@@ -377,6 +395,7 @@ class MATDiffPipeline:
             if avg_loss < best_loss - 1e-5:
                 best_loss = avg_loss
                 patience_counter = 0
+                best_state = copy.deepcopy(ema_denoiser.state_dict())
             else:
                 patience_counter += 1
 
@@ -390,7 +409,11 @@ class MATDiffPipeline:
                     print(f"  Early stopping at epoch {epoch+1}")
                 break
 
-        self.denoiser.load_state_dict(ema_denoiser.state_dict())
+        # Load best model
+        if best_state is not None:
+            self.denoiser.load_state_dict(best_state)
+        else:
+            self.denoiser.load_state_dict(ema_denoiser.state_dict())
         self.privacy = None
         self._fit_epochs = epochs
         self._fit_batch = batch_size
@@ -409,13 +432,28 @@ class MATDiffPipeline:
         return self
         
     @torch.no_grad()
-    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.5):
-        """DDPM reverse step — standard, no tricks."""
+    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=2.0):
+        """DDPM reverse step with Classifier-Free Guidance.
+        
+        CFG: noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        This pushes samples toward the conditioned class.
+        """
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+        # Conditional prediction (with class label)
+        noise_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+        
+        # Unconditional prediction (without class label) for CFG
+        if guidance_scale > 1.0 and y is not None:
+            # Use null class (or random class) for unconditional
+            y_uncond = torch.zeros_like(y)  # Class 0 as "null"
+            noise_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curvature)
+            # CFG combination
+            noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        else:
+            noise_pred = noise_cond
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -515,20 +553,23 @@ class MATDiffPipeline:
             X_syn = np.clip(X_syn, 0.0, 1.0)
             X_syn = np.nan_to_num(X_syn, nan=0.5, posinf=1.0, neginf=0.0)
             
-            # Quality filtering: keep samples closest to real minority distribution
+            # Quality filtering: keep samples that look most like real minority
             X_real_c = self.X_train[self.y_train == class_label]
-            if len(X_real_c) >= 3 and len(X_syn) > n_needed:
-                from sklearn.neighbors import NearestNeighbors
+            if len(X_real_c) >= 10 and len(X_syn) > n_needed:
+                from sklearn.ensemble import RandomForestClassifier
                 
-                # Find distance from each synthetic to nearest real sample
-                nn = NearestNeighbors(n_neighbors=1, algorithm='auto')
-                nn.fit(X_real_c)
-                dists, _ = nn.kneighbors(X_syn)
-                dists = dists.flatten()
+                # Train a quick discriminator: real (1) vs synthetic (0)
+                X_disc = np.vstack([X_real_c, X_syn])
+                y_disc = np.array([1] * len(X_real_c) + [0] * len(X_syn))
                 
-                # Keep the n_needed samples with SMALLEST distance to real data
-                # These are most realistic
-                keep_indices = np.argsort(dists)[:n_needed]
+                disc = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
+                disc.fit(X_disc, y_disc)
+                
+                # Get probability of each synthetic being "real"
+                probs_real = disc.predict_proba(X_syn)[:, 1]
+                
+                # Keep top n_needed by "realness" probability
+                keep_indices = np.argsort(probs_real)[-n_needed:]
                 X_syn = X_syn[keep_indices]
             else:
                 X_syn = X_syn[:n_needed]
@@ -595,6 +636,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
