@@ -432,28 +432,13 @@ class MATDiffPipeline:
         return self
         
     @torch.no_grad()
-    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=2.0):
-        """DDPM reverse step with Classifier-Free Guidance.
-        
-        CFG: noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
-        This pushes samples toward the conditioned class.
-        """
+    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.5):
+        """DDPM reverse step - simple, no CFG."""
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        # Conditional prediction (with class label)
-        noise_cond = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-        
-        # Unconditional prediction (without class label) for CFG
-        if guidance_scale > 1.0 and y is not None:
-            # Use null class (or random class) for unconditional
-            y_uncond = torch.zeros_like(y)  # Class 0 as "null"
-            noise_uncond = self.denoiser(x_t, t_tensor, y=y_uncond, curvature=curvature)
-            # CFG combination
-            noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
-        else:
-            noise_pred = noise_cond
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -694,6 +679,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
