@@ -190,31 +190,40 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
 
 
 def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load dataset with sklearn fallback for common datasets."""
-    
-    # Sklearn fallback for optical_digits (OpenML id=28 often fails)
+    """Load, preprocess, and split a dataset.
+
+    Returns:
+        (X_train, y_train, X_test, y_test) — all numpy arrays, features normalized to [0,1]
+    """
+    # Handle optical_digits specially using sklearn's built-in dataset
+    # because OpenML id=28 frequently fails
     if dataset_name == "optical_digits":
-        try:
-            from sklearn.datasets import load_digits
-            from sklearn.preprocessing import QuantileTransformer
-            from sklearn.model_selection import train_test_split as tts
-            
-            digits = load_digits()
-            X, y = digits.data, digits.target
-            
-            # Apply minority rule: class 8 is minority
-            y_binary = (y == 8).astype(int)
-            
-            scaler = QuantileTransformer(output_distribution="uniform", random_state=seed)
-            X_scaled = scaler.fit_transform(X)
-            
-            X_tr, X_te, y_tr, y_te = tts(X_scaled, y_binary, test_size=0.2, 
-                                          random_state=seed, stratify=y_binary)
-            print(f"    Loaded optical_digits from sklearn (fallback)")
-            return X_tr, y_tr, X_te, y_te
-        except Exception as e:
-            print(f"    sklearn fallback failed: {e}")
-            
+        from sklearn.datasets import load_digits
+        from sklearn.model_selection import train_test_split as sklearn_split
+        
+        digits = load_digits()
+        X, y = digits.data, digits.target
+        
+        # Apply minority rule: class 8 is minority (same as config)
+        y_binary = (y == 8).astype(int)
+        
+        # Use the ALREADY IMPORTED QuantileTransformer from module level
+        scaler = QuantileTransformer(output_distribution="uniform", random_state=seed)
+        X_scaled = scaler.fit_transform(X)
+        
+        X_tr, X_te, y_tr, y_te = sklearn_split(
+            X_scaled, y_binary, test_size=0.2, random_state=seed, stratify=y_binary
+        )
+        
+        dist = dict(zip(*np.unique(y_tr, return_counts=True)))
+        ir = max(dist.values()) / max(1, min(dist.values()))
+        print(f"    Loaded optical_digits from sklearn (fallback)")
+        print(f"    Samples: {len(X_tr)} train, {len(X_te)} test")
+        print(f"    Features: {X_tr.shape[1]}, Classes: {len(dist)}, IR: {ir:.1f}")
+        print(f"    Distribution: {dist}")
+        
+        return X_tr, y_tr, X_te, y_te
+
     if dataset_name not in DATASET_REGISTRY:
         raise KeyError(f"Unknown dataset: {dataset_name}. Available: {list(DATASET_REGISTRY.keys())}")
 
@@ -335,6 +344,7 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     print(f"    Distribution: {dist}")
 
     return X_tr, y_tr, X_te, y_te
+
 
 
 
