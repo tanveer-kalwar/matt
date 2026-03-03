@@ -204,10 +204,18 @@ class MATDiffDenoiser(nn.Module):
             y_int = torch.clamp(y_int, 0, self.num_classes - 1)
             c_emb = self.class_embed(y_int)
             cond_parts.append(c_emb)
+        elif self.class_embed is not None:
+            # Provide zero embedding if y is None
+            c_emb = torch.zeros(x.shape[0], self.d_model, device=x.device)
+            cond_parts.append(c_emb)
 
         # Curvature embedding
-        if self.curvature_proj is not None and curvature is not None:
-            curv_input = curvature.float().unsqueeze(-1)
+        if self.curvature_proj is not None:
+            if curvature is not None:
+                curv_input = curvature.float().view(-1, 1)
+            else:
+                # Default curvature = 0.5 if not provided
+                curv_input = torch.full((x.shape[0], 1), 0.5, device=x.device)
             curv_emb = self.curvature_proj(curv_input)
             cond_parts.append(curv_emb)
 
@@ -222,6 +230,7 @@ class MATDiffDenoiser(nn.Module):
         # Output
         h = self.output_norm(h, cond)
         return self.output_proj(h)
+
 
 
 
