@@ -109,7 +109,7 @@ class SpectralCurriculumScheduler:
             t_high = max(t_low + 1, min(t_high, self.total_timesteps))
             self.phase_timestep_ranges[i] = (t_low, t_high)
 
-        def _compute_beta_schedules(self):
+    def _compute_beta_schedules(self):
         """Per-phase cosine beta schedules derived from spectral energy.
 
         Uses DDPM bounds [1e-4, 0.02] modulated by energy fraction.
@@ -176,6 +176,7 @@ class SpectralCurriculumScheduler:
             t = torch.cat([t_phase, t_full])
             t = t[torch.randperm(len(t), device=device)]
             return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
 
 
 
