@@ -204,17 +204,30 @@ class MATDiffPipeline:
 
         if init_fim_tensor.shape[0] != self.d_model:
             if init_fim_tensor.shape[0] > self.d_model:
-                # Project DOWN: n_features > d_model (valid — reduces dimensionality).
-                # Keep the top d_model eigenvectors with largest eigenvalues.
-                # This is mathematically sound: PCA-style reduction of FIM.
+                # Project DOWN correctly: keep top eigenvectors AND their structure
+                # V @ diag(lambda) @ V^T preserves the metric geometry
                 try:
                     eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
-                    top_vals = eigvals[-self.d_model:].clamp(min=1e-10)
-                    init_fim_tensor = torch.diag(top_vals)
+                    # Take top d_model eigenvectors (by eigenvalue magnitude)
+                    top_indices = torch.argsort(eigvals, descending=True)[:self.d_model]
+                    top_vals = eigvals[top_indices].clamp(min=1e-10)
+                    top_vecs = eigvecs[:, top_indices]  # (n_features, d_model)
+                    # Project FIM to d_model space: V_top^T @ FIM @ V_top
+                    init_fim_tensor = top_vecs.T @ init_fim_tensor @ top_vecs
+                    # Ensure PD after projection
+                    eigvals_proj = torch.linalg.eigvalsh(init_fim_tensor)
+                    if eigvals_proj.min() <= 0:
+                        init_fim_tensor = init_fim_tensor + torch.eye(self.d_model, device=self.device) * (abs(eigvals_proj.min().item()) + 1e-8)
                 except Exception:
                     init_fim_tensor = None
             else:
-                init_fim_tensor = None
+                # n_features < d_model: pad with identity for extra dimensions
+                # This is safe because input_proj maps n_features -> d_model,
+                # so extra dimensions have no real-data signal anyway
+                padded = torch.eye(self.d_model, device=self.device)
+                s = init_fim_tensor.shape[0]
+                padded[:s, :s] = init_fim_tensor
+                init_fim_tensor = padded
 
         dim_t = max(64, self.d_model // 2)
         use_geodesic = getattr(self, 'use_geodesic', True)
@@ -427,33 +440,29 @@ class MATDiffPipeline:
             return mean
 
     @torch.no_grad()
-    def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, guidance_scale=1.5):
-        """DDIM deterministic sampling step."""
+    def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, eta=0.5):
+        """DDIM sampling step with optional stochasticity (eta > 0)."""
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
         noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
 
-        # DDIM update
         alpha_t = self.alphas_cumprod[t_idx]
         alpha_prev = self.alphas_cumprod[t_prev_idx] if t_prev_idx >= 0 else torch.tensor(1.0, device=self.device)
 
         # Predict x_0
         x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-
-        # Clamp x0 to training data range — NO margin
-        # QuantileTransformer maps to [0, 1], samples must stay in [0, 1]
         x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
 
-        # Direction pointing to x_t
-        dir_xt = torch.sqrt(1 - alpha_prev) * noise_pred
-
-        # DDIM deterministic step
-        x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt
+        # DDIM with stochasticity (eta > 0 adds noise for diversity)
+        sigma = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_prev)
+        dir_xt = torch.sqrt(1 - alpha_prev - sigma**2) * noise_pred
+        
+        noise = torch.randn_like(x_t) if eta > 0 else 0
+        x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt + sigma * noise
 
         return x_prev
-
     def sample(self, n_per_class=None):
         """Generate synthetic minority samples using DDPM (not DDIM).
         
@@ -479,13 +488,20 @@ class MATDiffPipeline:
                         deficit = min(deficit, int(cnt * 5))
                     n_per_class[int(c)] = deficit
 
-        # Seed RNG from model weights so each trained variant produces unique samples.
-        # Fixes thyroid_sick RNG collision (all variants stopped at same epoch → same RNG).
-        # Weight-based seed: unique per model (different Fisher/Geodesic training → different weights).
-        # Not a fixed constant (avoids locking any dataset to a bad fixed seed like 1004).
+        # Seed RNG using a combination of model weights AND ablation flags
+        # This ensures different ablation variants get different seeds even if
+        # weight sums are similar (they converge to similar loss on same data)
         try:
-            _param_hash = int(abs(sum(p.sum().item() for p in self.denoiser.parameters())) * 1e6) % (2**31)
+            _weight_sum = sum(p.sum().item() for p in self.denoiser.parameters())
+            # Add flags to differentiate ablation variants
+            _flag_bits = (
+                (1 if getattr(self, 'use_fisher_weights', True) else 0) +
+                (2 if getattr(self, 'use_geodesic', True) else 0) +
+                (4 if getattr(self, 'use_spectral', True) else 0)
+            )
+            _param_hash = int(abs(_weight_sum * 1e6 + _flag_bits * 1e9)) % (2**31)
             torch.manual_seed(_param_hash)
+            np.random.seed(_param_hash % (2**31))
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(_param_hash)
         except Exception:
@@ -528,10 +544,15 @@ class MATDiffPipeline:
                     timesteps.append(self.total_timesteps - 1)
                 timesteps = sorted(timesteps, reverse=True)
 
-                for i, t_idx in enumerate(timesteps):
-                    t_prev_idx = timesteps[i + 1] if i + 1 < len(timesteps) else -1
-                    x_t = self._ddim_sample_step(x_t, t_idx, t_prev_idx,
-                                                  y=y_cond, curvature=curvature)
+                # Use DDPM for more diverse samples on small minority datasets
+                # DDPM is stochastic; DDIM is deterministic → DDPM adds diversity
+                sampling_steps = getattr(self, '_sampling_steps', 200)
+                stride = max(1, self.total_timesteps // sampling_steps)
+                
+                # For DDPM, we need to iterate through ALL timesteps (no skipping)
+                # because DDPM posterior variance assumes t -> t-1 consecutive
+                for t_idx in range(self.total_timesteps - 1, -1, -1):
+                    x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=curvature)
 
                 # Clamp to data range
                 x_t = torch.clamp(x_t, 0.0, 1.0)
@@ -554,7 +575,7 @@ class MATDiffPipeline:
                 X_syn = (X_syn - syn_mean) / (syn_std + 1e-6) * real_std + real_mean
                 X_syn = np.clip(X_syn, 0.0, 1.0)
                 X_syn = np.nan_to_num(X_syn, nan=0.0, posinf=1.0, neginf=0.0)
-
+                
                 # Step 2: k-NN quality filter — reject samples too far from
                 # any real minority sample (they're noise, not learned structure).
                 # Keep samples within 3x median nearest-neighbor distance.
@@ -640,6 +661,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
