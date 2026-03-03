@@ -988,15 +988,20 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             if variant_name == "w/o Fisher":
                 use_fisher_weights = False
+                use_geodesic = True
+                use_spectral = True
             elif variant_name == "w/o Geodesic":
+                use_fisher_weights = True
                 use_geodesic = False
+                use_spectral = True
             elif variant_name == "w/o Spectral":
-                # DO NOT set n_phases=1. That is useless when the full model already
-                # derives n_phases=1 (wine_quality: 11 features, coil_2000: 19 minority).
-                # Result would be identical configs and score differences = pure noise.
-                # Correct ablation: use cosine schedule as the no-spectral baseline.
+                use_fisher_weights = True
+                use_geodesic = True
                 use_spectral = False
-            # MAT-Diff (Ours): use_spectral=True (spectral-fitted schedule)
+            elif variant_name == "MAT-Diff (Ours)":
+                use_fisher_weights = True
+                use_geodesic = True
+                use_spectral = True
 
             try:
                 # Seed TRAINING per variant: different batch permutations ->
@@ -1269,6 +1274,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
