@@ -281,39 +281,25 @@ class MATDiffPipeline:
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
             curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
 
-        # Fisher loss weights: boundary-proximity sample weighting.
-        # Minority samples closest to majority centroid = hardest boundary samples.
-        # Weight these more in loss so model learns boundary region accurately.
+        # Fisher feature-importance loss weighting.
+        # FIM diagonal = how much each feature shifts the class posterior.
+        # Weight MSE loss on HIGH-FIM features more heavily → model learns to
+        # reconstruct discriminative features accurately. All 5 classifiers benefit.
+        # This is analogous to DGOT/GOIO: geometry guides accuracy of generation.
         if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            weight_per_sample = torch.ones(len(y_minority), device=self.device)
+            feature_loss_weights = torch.ones(self.n_features, device=self.device)
         else:
-            majority_class = max(cc.keys(), key=lambda c: cc[c])
-            X_majority_arr = X_train[y_train == majority_class]
-            maj_mean = X_majority_arr.mean(axis=0)
-
             fim_key = int(minority_classes[0])
             if fim_key in self.fisher.fim_matrices:
                 fim_diag = np.diag(self.fisher.fim_matrices[fim_key]).clip(1e-10)
-                fim_diag = fim_diag / (fim_diag.max() + 1e-12)
+                fim_diag_norm = fim_diag / (fim_diag.mean() + 1e-12)
+                fim_diag_norm = np.clip(fim_diag_norm, 0.5, 2.0)  # cap: no single feature dominates
             else:
-                fim_diag = np.ones(self.n_features)
-
-            dists_to_maj = np.array([
-                float(np.sqrt(np.dot((x - maj_mean) ** 2, fim_diag)))
-                for x in X_minority
-            ])
-            d_min, d_max = dists_to_maj.min(), dists_to_maj.max()
-            if d_max > d_min:
-                dists_norm = (dists_to_maj - d_min) / (d_max - d_min)
-            else:
-                dists_norm = np.ones(len(y_minority)) * 0.5
-
-            weights_np = 2.0 - dists_norm
-            weights_np = weights_np / (weights_np.mean() + 1e-12)
-            weight_per_sample = torch.tensor(
-                weights_np.astype(np.float32), dtype=torch.float32, device=self.device
+                fim_diag_norm = np.ones(self.n_features)
+            feature_loss_weights = torch.tensor(
+                fim_diag_norm.astype(np.float32), dtype=torch.float32, device=self.device
             )
-        feature_loss_weights = torch.ones(self.n_features, device=self.device)
+        weight_per_sample = torch.ones(len(y_minority), device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -476,6 +462,18 @@ class MATDiffPipeline:
                         deficit = min(deficit, int(cnt * 5))
                     n_per_class[int(c)] = deficit
 
+        # Seed RNG from model weights so each trained variant produces unique samples.
+        # Fixes thyroid_sick RNG collision (all variants stopped at same epoch → same RNG).
+        # Weight-based seed: unique per model (different Fisher/Geodesic training → different weights).
+        # Not a fixed constant (avoids locking any dataset to a bad fixed seed like 1004).
+        try:
+            _param_hash = int(abs(sum(p.sum().item() for p in self.denoiser.parameters())) * 1e6) % (2**31)
+            torch.manual_seed(_param_hash)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(_param_hash)
+        except Exception:
+            pass
+
         all_X, all_y = [], []
         MAX_BATCH = 512
 
@@ -625,6 +623,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
