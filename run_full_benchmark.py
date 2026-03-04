@@ -986,22 +986,23 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             use_spectral = True  
             n_phases = cfg["n_phases"]
 
+            # Configure variant flags
             if variant_name == "w/o Fisher":
-                use_fisher_weights = False
-                use_geodesic = True
-                use_spectral = True
+                pipeline.use_fisher_weights = False
+                pipeline.use_geodesic = True
+                pipeline.use_spectral = True
             elif variant_name == "w/o Geodesic":
-                use_fisher_weights = True
-                use_geodesic = False
-                use_spectral = True
+                pipeline.use_fisher_weights = True
+                pipeline.use_geodesic = False
+                pipeline.use_spectral = True
             elif variant_name == "w/o Spectral":
-                use_fisher_weights = True
-                use_geodesic = True
-                use_spectral = False
-            elif variant_name == "MAT-Diff (Ours)":
-                use_fisher_weights = True
-                use_geodesic = True
-                use_spectral = True
+                pipeline.use_fisher_weights = True
+                pipeline.use_geodesic = True
+                pipeline.use_spectral = False
+            else:  # MAT-Diff (Ours)
+                pipeline.use_fisher_weights = True
+                pipeline.use_geodesic = True
+                pipeline.use_spectral = True
 
             try:
                 # Seed TRAINING per variant: different batch permutations ->
@@ -1274,6 +1275,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
