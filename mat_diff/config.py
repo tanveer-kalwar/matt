@@ -12,7 +12,7 @@ Hyperparameter derivation rules:
               Representation capacity scales with input dimension
     n_blocks: 2 if n_features <= 20, else 3
               Deeper networks for higher-dimensional inputs
-    n_heads:  max(2, d_model // 64)
+    n_heads:  max(2,  // 64)
               Each attention head handles approximately 64 dimensions
     batch_size: min(256, max(32, n_samples // 8))
               Approximately 8 batches per epoch for stable gradient estimates
@@ -166,6 +166,10 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
 
     # n_heads: Each head handles ~64 dimensions, minimum 2
     n_heads = max(2, d_model // 64)
+    # Must divide d_model evenly
+    while d_model % n_heads != 0 and n_heads > 2:
+        n_heads -= 1
+    n_heads = max(2, n_heads)
 
     # Smaller batches for minority-only training (typically 100-500 samples)
     minority_estimate = max(10, n_samples // max(ir, 2))
@@ -173,9 +177,11 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batch_size = 2 ** round(math.log2(max(16, batch_size)))
 
     # More epochs needed because training on minority data only (much smaller)
-    base_epochs = 500
-    ir_bonus = int(80 * math.log2(max(ir, 1)))
-    epochs = min(1500, base_epochs + ir_bonus)
+    # More epochs needed because training on minority data only (much smaller)
+    # BUT: Cap more aggressively to prevent overfitting
+    base_epochs = 300  # REDUCED from 500
+    ir_bonus = int(60 * math.log2(max(ir, 1)))  # REDUCED from 80
+    epochs = min(800, base_epochs + ir_bonus)  # REDUCED cap from 1500
     if n_samples < 500:
         epochs = min(epochs, 800)
 
@@ -226,7 +232,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "epochs": epochs,
         "lr": 4e-4,
         "dropout": dropout,
-        "total_timesteps": 1000,
+        "total_timesteps": 200,
         "sampling_steps": sampling_steps,
         "n_phases": n_phases,
         "weight_decay": weight_decay,
@@ -250,5 +256,6 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
