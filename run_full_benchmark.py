@@ -936,6 +936,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         "w/o Fisher":       "Disable Fisher loss weighting (uniform weights)",
         "w/o Geodesic":     "Replace Geodesic Attention with standard attention",
         "w/o Spectral":     "Replace Spectral Curriculum with uniform linear schedule",
+        "w/o DMF":          "Disable Distribution Matching Filter (random selection)",
         "MAT-Diff (Ours)":  "Full model with all components",
     }
 
@@ -977,77 +978,55 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
 
+            # Configure variant flags BEFORE creating pipeline
             use_fisher_weights = True
             use_geodesic = True
-            n_phases = cfg["n_phases"]
-
-            use_fisher_weights = True
-            use_geodesic = True
-            use_spectral = True  
-            n_phases = cfg["n_phases"]
-
-            # Create pipeline for this variant
-            pipeline = MATDiffPipeline(
-                device=device,
-                d_model=cfg["d_model"],
-                d_hidden=cfg.get("d_hidden", cfg["d_model"] * 2),
-                n_blocks=cfg["n_blocks"],
-                n_heads=cfg["n_heads"],
-                n_phases=cfg.get("n_phases", 3),
-                total_timesteps=cfg.get("total_timesteps", 1000),
-                dropout=cfg.get("dropout", 0.1),
-                lr=cfg["lr"],
-                privacy_quantile=cfg.get("privacy_quantile", 0.05),
-            )
+            use_spectral = True
+            use_dmf = True
             
-            # Configure variant flags BEFORE training
             if variant_name == "w/o Fisher":
-                pipeline.use_fisher_weights = False
-                pipeline.use_geodesic = True
-                pipeline.use_spectral = True
+                use_fisher_weights = False
             elif variant_name == "w/o Geodesic":
-                pipeline.use_fisher_weights = True
-                pipeline.use_geodesic = False
-                pipeline.use_spectral = True
+                use_geodesic = False
             elif variant_name == "w/o Spectral":
-                pipeline.use_fisher_weights = True
-                pipeline.use_geodesic = True
-                pipeline.use_spectral = False
-            else:  # MAT-Diff (Ours)
-                pipeline.use_fisher_weights = True
-                pipeline.use_geodesic = True
-                pipeline.use_spectral = True
+                use_spectral = False
+            elif variant_name == "w/o DMF":
+                use_dmf = False
 
             try:
-                # Seed TRAINING per variant: different batch permutations ->
-                # different loss trajectory -> different early-stop epoch ->
-                # different PyTorch RNG at sample() -> different generated samples.
-                # Fixes thyroid_sick identical-variant bug without removing early stopping.
+                # Seed TRAINING per variant
                 _train_seed = {'w/o Fisher': 101, 'w/o Geodesic': 202,
-                               'w/o Spectral': 303, 'MAT-Diff (Ours)': 404}.get(variant_name, 42)
+                               'w/o Spectral': 303, 'w/o DMF': 505, 'MAT-Diff (Ours)': 404}.get(variant_name, 42)
                 torch.manual_seed(_train_seed)
                 np.random.seed(_train_seed)
 
+                # Create pipeline ONCE with correct flags
                 pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"],
-                    d_hidden=cfg["d_hidden"],
+                    d_hidden=cfg.get("d_hidden", cfg["d_model"] * 2),
                     n_blocks=cfg["n_blocks"],
                     n_heads=cfg["n_heads"],
-                    n_phases=n_phases,
-                    total_timesteps=cfg["total_timesteps"],
+                    n_phases=cfg["n_phases"] if use_spectral else 1,
+                    total_timesteps=cfg.get("total_timesteps", 1000),
                     dropout=cfg.get("dropout", 0.1),
                     lr=cfg["lr"],
                     weight_decay=cfg.get("weight_decay", 1e-5),
+                    privacy_quantile=cfg.get("privacy_quantile", 0.05),
                 )
+                
+                # Set flags AFTER creation
                 pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.use_geodesic = use_geodesic
                 pipeline.use_spectral = use_spectral
+                pipeline.use_dmf = use_dmf
+
                 pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
                              batch_size=cfg["batch_size"], verbose=False)
 
+                # Sample with different seed
                 torch.manual_seed({'w/o Fisher': 1001, 'w/o Geodesic': 1002,
-                                   'w/o Spectral': 1003, 'MAT-Diff (Ours)': 1004}.get(variant_name, 1000))
+                                   'w/o Spectral': 1003, 'w/o DMF': 1005, 'MAT-Diff (Ours)': 1004}.get(variant_name, 1000))
                 X_syn_raw, y_syn_raw = pipeline.sample()
                 trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
                 print("✓")
@@ -1200,7 +1179,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
         # Build pivot with formatted "mean ± std" strings
         pivot_data = {}
-        order = ["IDENTITY", "w/o Fisher", "w/o Geodesic", "w/o Spectral", "MAT-Diff (Ours)"]
+        order = ["IDENTITY", "w/o Fisher", "w/o Geodesic", "w/o Spectral", "w/o DMF", "MAT-Diff (Ours)"]
 
         for ds_name in df["Dataset"].unique():
             pivot_data[ds_name] = {}
@@ -1289,6 +1268,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
