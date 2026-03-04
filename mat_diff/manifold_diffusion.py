@@ -399,7 +399,7 @@ class MATDiffPipeline:
         return X_syn[keep_idx]
 
     def sample(self, n_per_class=None):
-        """Generate synthetic minority samples using per-class DDPM sampling."""
+        """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
         if not self.denoisers:
             raise RuntimeError("Call fit() before sample().")
 
@@ -427,15 +427,17 @@ class MATDiffPipeline:
             
             print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
 
-            # Generate 3x needed for DMF selection
-            n_generate = min(n_needed * 3, 5000)
+            # Generate 2x needed for DMF selection (not 3x)
+            n_generate = min(n_needed * 2, 1000)
             
-            # Use class-specific denoiser
-            denoiser_c = self.denoisers[int(class_label)]
-            X_syn = self._ddpm_sample_class(denoiser_c, n_generate)
+            # HYBRID: SMOTE base + light diffusion refinement
+            X_base = self._smote_base(X_real_c, n_generate)
+            X_refined = self._light_refinement(X_base, class_label)
+            X_final = self._adaptive_noise_injection(X_refined, class_label)
+            X_final = np.clip(X_final, 0.0, 1.0)
             
             # Apply DMF to select best samples
-            X_syn_filtered = self._distribution_matching_filter(X_syn, X_real_c, n_needed)
+            X_syn_filtered = self._distribution_matching_filter(X_final, X_real_c, n_needed)
             
             if len(X_syn_filtered) > 0:
                 all_X.append(X_syn_filtered)
@@ -446,40 +448,64 @@ class MATDiffPipeline:
 
         return np.vstack(all_X), np.concatenate(all_y)
 
-    def _ddpm_sample_class(self, denoiser, n_samples):
-        """Proper DDPM sampling using class-specific unconditional denoiser."""
-        denoiser.eval()
+    def _smote_base(self, X_real, n_generate):
+        """Generate base samples using SMOTE interpolation."""
+        n_real = len(X_real)
+        if n_real < 2:
+            return np.tile(X_real, (n_generate // max(1, n_real) + 1, 1))[:n_generate]
         
-        # Start from random noise
-        x = torch.randn(n_samples, self.n_features, device=self.device)
+        k = min(5, n_real - 1)
+        nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
+        nn.fit(X_real)
+        _, indices = nn.kneighbors(X_real)
         
-        # Reverse diffusion process
-        for t_idx in reversed(range(self.total_timesteps)):
-            t = torch.full((n_samples,), t_idx, device=self.device, dtype=torch.long)
+        synthetic = []
+        for _ in range(n_generate):
+            i = np.random.randint(0, n_real)
+            j = indices[i, np.random.randint(1, k + 1)]
             
-            with torch.no_grad():
-                # Unconditional sampling (y=None)
-                noise_pred = denoiser(x, t, y=None, curvature=None)
-                
-                # DDPM sampling equation
-                alpha = self.alphas[t_idx]
-                alpha_bar = self.alphas_cumprod[t_idx]
-                beta = self.betas[t_idx]
-                
-                # Compute mean
-                coef1 = 1.0 / torch.sqrt(alpha)
-                coef2 = beta / torch.sqrt(1.0 - alpha_bar)
-                mean = coef1 * (x - coef2 * noise_pred)
-                
-                if t_idx > 0:
-                    # Add noise (except for final step)
-                    noise = torch.randn_like(x)
-                    sigma = torch.sqrt(beta)
-                    x = mean + sigma * noise
-                else:
-                    x = mean
+            # Random interpolation
+            alpha = np.random.random()
+            x_new = X_real[i] + alpha * (X_real[j] - X_real[i])
+            synthetic.append(x_new)
         
-        return torch.clamp(x, 0.0, 1.0).cpu().numpy()
+        return np.array(synthetic)
+
+    def _light_refinement(self, X_base, class_label, noise_level=0.3):
+        """Single-step diffusion refinement with conservative blending."""
+        if int(class_label) not in self.denoisers:
+            return X_base
+            
+        try:
+            denoiser = self.denoisers[int(class_label)]
+            denoiser.eval()
+            
+            X_t = torch.tensor(X_base, dtype=torch.float32, device=self.device)
+            
+            # Add noise at moderate timestep (20% of total)
+            t_val = int(self.total_timesteps * 0.2)
+            t = torch.full((len(X_t),), t_val, dtype=torch.long, device=self.device)
+            
+            noise = torch.randn_like(X_t) * noise_level
+            X_noisy = self._q_sample(X_t, t, noise)
+            
+            # Single-step denoise
+            with torch.no_grad():
+                noise_pred = denoiser(X_noisy, t, y=None)
+                
+                alpha_t = self.sqrt_alphas_cumprod[t_val]
+                sigma_t = self.sqrt_one_minus_alphas_cumprod[t_val]
+                
+                X_denoised = (X_noisy - sigma_t * noise_pred) / alpha_t
+                X_denoised = torch.clamp(X_denoised, 0.0, 1.0)
+            
+            # Conservative blend: 70% denoised, 30% original SMOTE
+            X_blended = 0.7 * X_denoised.cpu().numpy() + 0.3 * X_base
+            
+            return np.clip(X_blended, 0.0, 1.0)
+            
+        except Exception as e:
+            return X_base
 
     def _diffusion_refine(self, X_interp, class_label, n_steps=50):
         """Light diffusion refinement using trained denoiser.
@@ -564,6 +590,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
