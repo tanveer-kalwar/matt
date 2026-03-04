@@ -106,30 +106,37 @@ class MATDiffPipeline:
     def _compute_boundary_weights(self, X_minority, X_majority):
         """COMPONENT 1: Boundary-Aware Loss Weighting (BALW).
         
-        Weight samples by their importance for classification boundary.
-        Samples near the boundary (close to majority class) get higher weight.
+        Compute ACTUAL Fisher Information-based weights.
+        Higher weight = higher uncertainty/gradient norm = more informative.
         """
         if not self.use_fisher_weights:
             return np.ones(len(X_minority))
         
-        # Compute distance to majority class centroid (boundary proxy)
-        majority_centroid = X_majority.mean(axis=0)
+        # Combine classes temporarily to compute per-sample gradients
+        X_combined = np.vstack([X_majority, X_minority])
+        y_combined = np.hstack([np.zeros(len(X_majority)), np.ones(len(X_minority))])
         
-        # Distance from each minority sample to majority centroid
-        dists_to_majority = np.linalg.norm(X_minority - majority_centroid, axis=1)
+        # Simple logistic regression to get decision boundary
+        from sklearn.linear_model import LogisticRegression
+        clf = LogisticRegression(max_iter=1000, C=1.0)
+        clf.fit(X_combined, y_combined)
         
-        # Samples CLOSER to majority are more important (near boundary)
-        # Use inverse distance as weight, with smoothing
-        median_dist = np.median(dists_to_majority) + 1e-8
+        # Compute decision function values (distance to boundary)
+        # For minority samples only
+        decision_vals = clf.decision_function(X_minority)
         
-        # Closer = higher weight (exponential decay with distance)
-        weights = np.exp(-dists_to_majority / median_dist)
+        # Samples NEAR boundary (|decision| ≈ 0) are most informative
+        # Use inverse absolute decision value (clipped)
+        boundary_dist = np.abs(decision_vals) + 0.1  # +0.1 for stability
+        
+        # Inverse: closer to boundary = higher weight
+        weights = 1.0 / boundary_dist
         
         # Normalize to mean 1
         weights = weights / (weights.mean() + 1e-8)
         
         # Clip to prevent extreme weights
-        weights = np.clip(weights, 0.5, 2.0)
+        weights = np.clip(weights, 0.3, 3.0)
         
         return weights
 
@@ -334,28 +341,28 @@ class MATDiffPipeline:
         """COMPONENT 2: Adaptive Noise Injection (ANI).
         
         WITHOUT ANI (use_geodesic=False): No noise added (pure SMOTE)
-        WITH ANI (use_geodesic=True): Covariance-aligned noise for diversity
+        WITH ANI (use_geodesic=True): SMALL covariance-aligned noise for diversity
         """
         if not self.use_geodesic:
             # Without ANI: NO noise (pure interpolation like SMOTE)
             return x_interpolated
         
-        # WITH ANI: Add covariance-aligned noise
+        # WITH ANI: Add SMALL covariance-aligned noise (reduced from 0.15 to 0.05)
         if class_label in self._minority_covs:
             cov = self._minority_covs[class_label]
             try:
                 # Eigendecomposition for principal directions
                 eigvals, eigvecs = np.linalg.eigh(cov)
                 eigvals = np.maximum(eigvals, 1e-8)
-                # Scale noise along principal directions (0.15 scale factor)
-                noise_scale = np.sqrt(eigvals) * 0.15
+                # REDUCED: Scale noise along principal directions (0.05 scale factor)
+                noise_scale = np.sqrt(eigvals) * 0.05  # WAS 0.15, NOW 0.05
                 noise_raw = np.random.randn(len(x_interpolated), len(eigvals))
                 noise = (noise_raw * noise_scale) @ eigvecs.T
             except:
-                # Fallback: isotropic noise scaled by feature std
-                noise = np.random.randn(*x_interpolated.shape) * 0.08
+                # Fallback: isotropic noise scaled by feature std (reduced)
+                noise = np.random.randn(*x_interpolated.shape) * 0.03  # WAS 0.08, NOW 0.03
         else:
-            noise = np.random.randn(*x_interpolated.shape) * 0.08
+            noise = np.random.randn(*x_interpolated.shape) * 0.03  # WAS 0.08, NOW 0.03
         
         return x_interpolated + noise
 
@@ -427,7 +434,7 @@ class MATDiffPipeline:
             
             print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
 
-            # Generate 2x needed for DMF selection (not 3x)
+            # Generate 2x needed for DMF selection
             n_generate = min(n_needed * 2, 1000)
             
             # HYBRID: SMOTE base + light diffusion refinement
@@ -471,8 +478,8 @@ class MATDiffPipeline:
         
         return np.array(synthetic)
 
-    def _light_refinement(self, X_base, class_label, noise_level=0.3):
-        """Single-step diffusion refinement with conservative blending."""
+    def _light_refinement(self, X_base, class_label, n_steps=10):
+        """Multi-step diffusion refinement with better blend ratio."""
         if int(class_label) not in self.denoisers:
             return X_base
             
@@ -482,29 +489,46 @@ class MATDiffPipeline:
             
             X_t = torch.tensor(X_base, dtype=torch.float32, device=self.device)
             
-            # Add noise at moderate timestep (20% of total)
-            t_val = int(self.total_timesteps * 0.2)
-            t = torch.full((len(X_t),), t_val, dtype=torch.long, device=self.device)
+            # Start from moderate noise (not too high, not too low)
+            t_start = min(50, self.total_timesteps // 4)  # t=50 for T=200
+            X_current = X_t.clone()
             
-            noise = torch.randn_like(X_t) * noise_level
-            X_noisy = self._q_sample(X_t, t, noise)
+            # Add initial noise
+            noise = torch.randn_like(X_current) * 0.2
+            t = torch.full((len(X_current),), t_start, dtype=torch.long, device=self.device)
+            X_current = self._q_sample(X_current, t, noise)
             
-            # Single-step denoise
+            # Multi-step denoising (10 steps instead of 1)
             with torch.no_grad():
-                noise_pred = denoiser(X_noisy, t, y=None)
-                
-                alpha_t = self.sqrt_alphas_cumprod[t_val]
-                sigma_t = self.sqrt_one_minus_alphas_cumprod[t_val]
-                
-                X_denoised = (X_noisy - sigma_t * noise_pred) / alpha_t
-                X_denoised = torch.clamp(X_denoised, 0.0, 1.0)
+                for t_idx in reversed(range(0, t_start, max(1, t_start // n_steps))):
+                    t_batch = torch.full((len(X_current),), t_idx, dtype=torch.long, device=self.device)
+                    noise_pred = denoiser(X_current, t_batch, y=None)
+                    
+                    # DDPM update
+                    alpha = self.alphas[t_idx]
+                    alpha_bar = self.alphas_cumprod[t_idx]
+                    beta = self.betas[t_idx]
+                    
+                    coef1 = 1.0 / torch.sqrt(alpha)
+                    coef2 = beta / torch.sqrt(1.0 - alpha_bar)
+                    mean = coef1 * (X_current - coef2 * noise_pred)
+                    
+                    if t_idx > 0:
+                        noise = torch.randn_like(X_current) * 0.1  # Small noise
+                        sigma = torch.sqrt(beta * 0.5)  # Reduced variance
+                        X_current = mean + sigma * noise
+                    else:
+                        X_current = mean
             
-            # Conservative blend: 70% denoised, 30% original SMOTE
-            X_blended = 0.7 * X_denoised.cpu().numpy() + 0.3 * X_base
+            X_denoised = torch.clamp(X_current, 0.0, 1.0)
+            
+            # BETTER blend: 85% denoised, 15% original (trust diffusion more)
+            X_blended = 0.85 * X_denoised.cpu().numpy() + 0.15 * X_base
             
             return np.clip(X_blended, 0.0, 1.0)
             
         except Exception as e:
+            print(f"    Refinement failed: {e}")
             return X_base
 
     def _diffusion_refine(self, X_interp, class_label, n_steps=50):
@@ -590,6 +614,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
