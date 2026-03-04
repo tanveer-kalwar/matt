@@ -72,25 +72,35 @@ class SpectralCurriculumScheduler:
     def _compute_timestep_ranges(self):
         """Assign timestep ranges to each curriculum phase.
         
-        Phase 0: High timesteps (noisy, coarse structure)
-        Phase K: Low timesteps (clean, fine details)
+        Curriculum strategy: Easy → Hard
+        - Early phases: High timesteps (noisy, easier denoising)
+        - Late phases: Low timesteps (clean, harder denoising)
         """
-        # Divide timesteps into n_phases ranges
-        # Earlier phases focus on higher timesteps (more noise)
-        steps_per_phase = self.total_timesteps // self.n_phases
+        if self.n_phases == 1:
+            # Ablation: use full range
+            self.phase_timestep_ranges = [(0, self.total_timesteps)]
+            self.phase_energy_fractions = [1.0]
+            return
+            
+        steps_per_phase = max(1, self.total_timesteps // self.n_phases)
         
         self.phase_timestep_ranges = []
         self.phase_energy_fractions = []
         
         for i in range(self.n_phases):
-            # Phase i covers timesteps from t_low to t_high
-            # Phase 0 = highest timesteps, Phase n-1 = lowest
-            t_high = self.total_timesteps - i * steps_per_phase
-            t_low = max(0, t_high - steps_per_phase)
-            
-            # Last phase should cover down to 0
+            # Phase i: range of timesteps
+            # Phase 0 = highest timesteps (easiest), Phase n-1 = all timesteps
             if i == self.n_phases - 1:
-                t_low = 0
+                # Last phase: full range
+                t_low, t_high = 0, self.total_timesteps
+            else:
+                # Earlier phases: progressively higher timesteps only
+                t_low = self.total_timesteps - (i + 1) * steps_per_phase
+                t_high = self.total_timesteps - i * steps_per_phase
+            
+            # Clamp
+            t_low = max(0, min(t_low, self.total_timesteps - 1))
+            t_high = max(t_low + 1, min(t_high, self.total_timesteps))
             
             self.phase_timestep_ranges.append((t_low, t_high))
             self.phase_energy_fractions.append(1.0 / self.n_phases)
@@ -121,31 +131,30 @@ class SpectralCurriculumScheduler:
     def sample_timesteps(
         self, batch_size: int, epoch: int, total_epochs: int, device: str = "cpu"
     ) -> torch.Tensor:
-        """Sample timesteps with curriculum bias.
-        
-        Curriculum strategy:
-        - 60% from current phase range (curriculum focus)
-        - 40% from full range (prevent dead zones)
-        
-        If n_phases == 1: Pure uniform sampling (ablation baseline).
-        """
-        if self.n_phases <= 1:
-            # Ablation: uniform sampling over all timesteps
+        """Sample timesteps with curriculum bias."""
+        if self.n_phases <= 1 or len(self.phase_timestep_ranges) == 0:
+            # Ablation: uniform sampling
             return torch.randint(0, self.total_timesteps, (batch_size,), 
                                  device=device).long()
 
         t_low, t_high = self.get_timestep_range_for_epoch(epoch, total_epochs)
-        t_low = max(0, t_low)
+        
+        # Ensure valid range
+        t_low = max(0, min(t_low, self.total_timesteps - 1))
         t_high = max(t_low + 1, min(t_high, self.total_timesteps))
+        
+        if t_high - t_low < 2:
+            # Range too small, use uniform
+            return torch.randint(0, self.total_timesteps, (batch_size,), device=device).long()
 
-        # Split: 60% curriculum, 40% uniform
-        n_curriculum = int(batch_size * 0.6)
+        # Split: 70% curriculum, 30% uniform (adjusted from 60/40 for more focus)
+        n_curriculum = int(batch_size * 0.7)
         n_uniform = batch_size - n_curriculum
 
         # Curriculum samples from current phase
         t_curriculum = torch.randint(t_low, t_high, (n_curriculum,), device=device)
         
-        # Uniform samples from full range
+        # Uniform samples from full range (ensures coverage)
         t_uniform = torch.randint(0, self.total_timesteps, (n_uniform,), device=device)
         
         # Combine and shuffle
@@ -153,3 +162,4 @@ class SpectralCurriculumScheduler:
         t = t[torch.randperm(len(t), device=device)]
         
         return torch.clamp(t.long(), 0, self.total_timesteps - 1)
+
