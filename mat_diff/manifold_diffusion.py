@@ -369,41 +369,88 @@ class MATDiffPipeline:
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
         """COMPONENT 3: Distribution Matching Filter (DMF).
         
-        WITHOUT DMF (use_spectral=False): Random selection
-        WITH DMF (use_spectral=True): Select samples matching real distribution
+        WITHOUT DMF (use_dmf=False): Random selection
+        WITH DMF (use_dmf=True): Select diverse samples near real distribution
         """
         if len(X_syn) <= n_keep:
             return X_syn
         
-        if not self.use_dmf:  # Use separate flag!
+        if not self.use_dmf:
             idx = np.random.choice(len(X_syn), n_keep, replace=False)
             return X_syn[idx]
         
-        # WITH DMF: Use Mahalanobis distance to real distribution
+        # WITH DMF: Use combination of distance AND diversity
         real_mean = X_real.mean(axis=0)
         real_cov = np.cov(X_real, rowvar=False)
         if real_cov.ndim == 0:
             real_cov = np.array([[real_cov]])
         
-        # Regularize covariance
-        real_cov = real_cov + np.eye(real_cov.shape[0]) * 1e-6
+        # Regularize covariance heavily for stability
+        real_cov = real_cov + np.eye(real_cov.shape[0]) * 0.01  # WAS 1e-6, NOW 0.01
         
         try:
-            cov_inv = np.linalg.inv(real_cov)
+            # Use pseudo-inverse for stability
+            from numpy.linalg import pinv
+            cov_inv = pinv(real_cov)
         except:
-            # Fallback to diagonal
-            cov_inv = np.diag(1.0 / (np.diag(real_cov) + 1e-8))
+            cov_inv = np.diag(1.0 / (np.diag(real_cov) + 0.01))
         
-        # Mahalanobis distance: lower = closer to real distribution
-        scores = []
+        # Compute Mahalanobis distance
+        mahal_dist = []
         for x in X_syn:
             diff = x - real_mean
-            mahal = np.sqrt(diff @ cov_inv @ diff)
-            scores.append(-mahal)  # Negative because we want to maximize
+            d = np.sqrt(diff @ cov_inv @ diff)
+            mahal_dist.append(d)
+        mahal_dist = np.array(mahal_dist)
         
-        scores = np.array(scores)
-        keep_idx = np.argsort(scores)[-n_keep:]  # Keep highest scores (lowest distance)
-        return X_syn[keep_idx]
+        # GOOD samples are those WITHIN reasonable range (not too close, not too far)
+        # Keep samples with distance between 25th and 75th percentile of real samples
+        real_dists = []
+        for x in X_real:
+            diff = x - real_mean
+            d = np.sqrt(diff @ cov_inv @ diff)
+            real_dists.append(d)
+        real_dists = np.array(real_dists)
+        
+        p25, p75 = np.percentile(real_dists, [25, 75])
+        
+        # Score: prefer samples within [p25, p75*1.5] range, penalize outliers
+        scores = np.zeros(len(X_syn))
+        in_range = (mahal_dist >= p25) & (mahal_dist <= p75 * 1.5)  # Slightly wider
+        scores[in_range] = 1.0
+        
+        # Also penalize being too close (duplicates)
+        too_close = mahal_dist < p25 * 0.5
+        scores[too_close] = 0.3
+        
+        # Select top scoring, but ensure diversity with k-means
+        n_candidates = min(n_keep * 3, len(X_syn))
+        candidate_idx = np.argsort(scores)[-n_candidates:]
+        
+        if len(candidate_idx) <= n_keep:
+            return X_syn[candidate_idx]
+        
+        # Final selection: k-means++ style diversity selection
+        selected = [candidate_idx[0]]
+        candidates = set(candidate_idx[1:])
+        
+        while len(selected) < n_keep and candidates:
+            # Find furthest from already selected
+            max_min_dist = -1
+            best_idx = None
+            for idx in candidates:
+                min_dist = min([np.linalg.norm(X_syn[idx] - X_syn[s]) for s in selected])
+                if min_dist > max_min_dist:
+                    max_min_dist = min_dist
+                    best_idx = idx
+            
+            if best_idx is not None:
+                selected.append(best_idx)
+                candidates.remove(best_idx)
+            else:
+                break
+        
+        return X_syn[selected]
 
     def sample(self, n_per_class=None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
@@ -614,6 +661,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
