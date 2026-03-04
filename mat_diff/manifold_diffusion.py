@@ -316,20 +316,35 @@ class MATDiffPipeline:
             else:
                 feature_weights = torch.ones(self.n_features, device=self.device)
 
-        # Compute per-feature importance weights from FIM
-        # FIM diagonal = Fisher Information for each feature = discriminativeness
+        # Compute per-feature importance using Fisher Discriminant Ratio (FDR)
+        # FDR = (mu_minority - mu_majority)^2 / (var_minority + var_majority)
+        # This measures how discriminative each feature is for classification
         fim_feature_weights = torch.ones(self.n_features, device=self.device)
         if getattr(self, 'use_fisher_weights', True):
-            for c in minority_classes:
-                if int(c) in self.fisher.fim_matrices:
-                    fim = self.fisher.fim_matrices[int(c)]
-                    fim_diag = np.diag(fim).clip(1e-10)
-                    # Normalize to mean=1 so total loss magnitude unchanged
-                    fim_diag = fim_diag / (fim_diag.mean() + 1e-12)
-                    # Soft scaling with sqrt to prevent extreme weights
-                    fim_diag = np.sqrt(fim_diag)
-                    fim_feature_weights = torch.tensor(fim_diag, dtype=torch.float32, device=self.device)
-                    break  # Use first minority class FIM
+            try:
+                # Get majority class stats
+                majority_class = max(cc.keys(), key=lambda c: cc[c])
+                X_maj = X_train[y_train == majority_class]
+                mu_maj = X_maj.mean(axis=0)
+                var_maj = X_maj.var(axis=0) + 1e-10
+                
+                # Get minority class stats (average over all minority classes)
+                mu_min = X_minority.mean(axis=0)
+                var_min = X_minority.var(axis=0) + 1e-10
+                
+                # Fisher Discriminant Ratio per feature
+                fdr = (mu_min - mu_maj) ** 2 / (var_min + var_maj)
+                
+                # Normalize: mean = 1.0
+                fdr = fdr / (fdr.mean() + 1e-12)
+                
+                # Soft scaling: sqrt to prevent extreme weights
+                # Range: [0.5, 2.0] to avoid over-weighting
+                fdr = np.clip(np.sqrt(fdr), 0.5, 2.0)
+                
+                fim_feature_weights = torch.tensor(fdr, dtype=torch.float32, device=self.device)
+            except Exception:
+                fim_feature_weights = torch.ones(self.n_features, device=self.device)
 
         self.denoiser.train()
         best_loss = float('inf')
@@ -528,11 +543,10 @@ class MATDiffPipeline:
         return np.vstack(all_X), np.concatenate(all_y)
 
     def _sample_interpolation(self, X_real, n_needed, class_label):
-        """Diffusion-guided interpolation (hybrid SMOTE + diffusion).
+        """Geometry-aware interpolation (inspired by DGOT/GOIO).
         
-        1. Pick random pairs from real minority
-        2. Interpolate between them (SMOTE-style)
-        3. Add small diffusion-learned perturbation for diversity
+        Uses Fisher-weighted distance to select interpolation pairs,
+        ensuring synthetic samples lie in discriminative regions.
         """
         from sklearn.neighbors import NearestNeighbors
         
@@ -541,62 +555,49 @@ class MATDiffPipeline:
         if k < 1:
             return X_real.copy()
         
-        # Find k nearest neighbors for each sample
+        # Compute Fisher-weighted features for better neighbor selection
+        if hasattr(self, 'fisher') and self.fisher is not None:
+            fim_key = int(class_label)
+            if fim_key in self.fisher.fim_matrices:
+                fim_diag = np.diag(self.fisher.fim_matrices[fim_key])
+                fim_diag = np.maximum(fim_diag, 1e-10)
+                fim_diag = fim_diag / (fim_diag.sum() + 1e-12)
+                # Weight features by FIM for neighbor finding
+                X_weighted = X_real * np.sqrt(fim_diag)
+            else:
+                X_weighted = X_real
+        else:
+            X_weighted = X_real
+        
+        # Find k nearest neighbors using Fisher-weighted distance
         nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
-        nn.fit(X_real)
-        _, indices = nn.kneighbors(X_real)
+        nn.fit(X_weighted)
+        _, indices = nn.kneighbors(X_weighted)
         
         synthetic = []
+        for _ in range(n_needed):
+            # Pick random sample
+            idx = np.random.randint(0, n_real)
+            x1 = X_real[idx]
+            
+            # Pick random neighbor (Fisher-weighted selection)
+            neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
+            x2 = X_real[neighbor_idx]
+            
+            # Interpolate with slight bias toward center of minority distribution
+            # This prevents generating samples too close to class boundary
+            alpha = np.random.beta(2, 2)  # Beta distribution concentrates around 0.5
+            x_new = x1 + alpha * (x2 - x1)
+            
+            # Add small Gaussian noise for diversity (scaled by local variance)
+            local_std = np.abs(x2 - x1) * 0.1 + 0.01
+            noise = np.random.randn(len(x_new)) * local_std
+            x_new = x_new + noise
+            
+            x_new = np.clip(x_new, 0.0, 1.0)
+            synthetic.append(x_new)
         
-        # Process in batches for efficiency
-        batch_size = min(64, n_needed)
-        n_batches = (n_needed + batch_size - 1) // batch_size
-        
-        for batch_idx in range(n_batches):
-            current_batch_size = min(batch_size, n_needed - len(synthetic))
-            if current_batch_size <= 0:
-                break
-            
-            batch_samples = []
-            for _ in range(current_batch_size):
-                # Pick random sample
-                idx = np.random.randint(0, n_real)
-                x1 = X_real[idx]
-                
-                # Pick random neighbor
-                neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
-                x2 = X_real[neighbor_idx]
-                
-                # Interpolate (SMOTE)
-                alpha = np.random.uniform(0.3, 0.7)
-                x_new = x1 + alpha * (x2 - x1)
-                batch_samples.append(x_new)
-            
-            batch_samples = np.array(batch_samples)
-            
-            # Add small diffusion-learned perturbation
-            try:
-                with torch.no_grad():
-                    x_t = torch.tensor(batch_samples, dtype=torch.float32, device=self.device)
-                    y_cond = torch.full((len(batch_samples),), class_label, 
-                                        device=self.device, dtype=torch.long)
-                    # Use low noise level timestep
-                    t = torch.full((len(batch_samples),), 50, device=self.device, dtype=torch.long)
-                    
-                    # Get denoiser's prediction of noise direction
-                    noise_pred = self.denoiser(x_t, t, y=y_cond, curvature=None)
-                    
-                    # Add small perturbation in learned direction
-                    perturbation = 0.03 * noise_pred.cpu().numpy()
-                    batch_samples = batch_samples + perturbation
-            except Exception as e:
-                # If denoiser fails, just use SMOTE interpolation without perturbation
-                pass
-            
-            batch_samples = np.clip(batch_samples, 0.0, 1.0)
-            synthetic.extend(batch_samples)
-        
-        return np.array(synthetic[:n_needed])
+        return np.array(synthetic)
 
     def _sample_diffusion(self, n_needed, class_label):
         """Full diffusion sampling for larger minority classes."""
@@ -698,6 +699,7 @@ class MATDiffPipeline:
             )
         print(f"  Model loaded from {path}")
         return self
+
 
 
 
