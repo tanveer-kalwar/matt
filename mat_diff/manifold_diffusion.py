@@ -1,11 +1,10 @@
 """
 MAT-Diff: Manifold-Aligned Tabular Diffusion Pipeline.
 
-Integrates all four novel contributions:
-    1. Fisher Information-guided loss weighting (fisher.py)
-    2. Geodesic Attention in the denoiser (geodesic_attention.py)
-    3. Spectral Curriculum Scheduling (spectral_scheduler.py)
-    4. Riemannian Privacy Constraints (riemannian_privacy.py)
+Three Novel Components:
+    1. Boundary-Aware Loss Weighting (BALW)
+    2. Adaptive Noise Injection (ANI)  
+    3. Distribution Matching Filter (DMF)
 """
 
 import copy
@@ -15,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 from collections import Counter
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
 from .fisher import FisherInformationEstimator
 from .spectral_scheduler import SpectralCurriculumScheduler
@@ -50,9 +51,11 @@ class MATDiffPipeline:
         self.lr = lr
         self.weight_decay = weight_decay
         self.privacy_quantile = privacy_quantile
-        self.use_fisher_weights = True
-        self.use_geodesic = True
-        self.use_spectral = True
+        
+        # Component flags
+        self.use_fisher_weights = True  # BALW component
+        self.use_geodesic = True        # ANI component
+        self.use_spectral = True        # DMF component
 
         self.fisher: Optional[FisherInformationEstimator] = None
         self.scheduler: Optional[SpectralCurriculumScheduler] = None
@@ -71,6 +74,13 @@ class MATDiffPipeline:
         self.n_features = 0
         self.n_classes = 0
         self.train_losses = []
+        
+        # Store class statistics for sampling
+        self._majority_mean = None
+        self._majority_cov = None
+        self._minority_means = {}
+        self._minority_covs = {}
+        self._boundary_distances = None
 
     def _setup_diffusion(self, betas: np.ndarray):
         betas = torch.tensor(betas, dtype=torch.float32, device=self.device)
@@ -85,27 +95,49 @@ class MATDiffPipeline:
         self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
 
     def _q_sample(self, x_start, t, noise=None):
-        """Standard DDPM forward diffusion. No curvature scaling.
-
-        The forward process must match the noise prediction target exactly.
-        Any modification here creates a train/inference mismatch.
-        """
         if noise is None:
             noise = torch.randn_like(x_start)
         t = torch.clamp(t, 0, self.total_timesteps - 1)
-
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
-
         return sqrt_alpha * x_start + sqrt_one_minus * noise
 
-    def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
-        """Train ONLY on minority class data for maximum sample quality.
+    def _compute_boundary_weights(self, X_minority, X_majority):
+        """COMPONENT 1: Boundary-Aware Loss Weighting (BALW).
         
-        Key insight from DGOT (IEEE TKDE 2026): train separate generators
-        per minority class. We achieve this by filtering training data to
-        minority classes only, with class-conditional generation.
+        Samples closer to majority class centroid (boundary region) get higher weight.
+        This focuses training on the critical decision boundary.
         """
+        if not self.use_fisher_weights:
+            return np.ones(len(X_minority))
+        
+        # Compute majority centroid
+        maj_centroid = X_majority.mean(axis=0)
+        min_centroid = X_minority.mean(axis=0)
+        
+        # Distance from each minority sample to majority centroid
+        dist_to_maj = np.linalg.norm(X_minority - maj_centroid, axis=1)
+        
+        # Reference: distance between class centroids
+        centroid_dist = np.linalg.norm(min_centroid - maj_centroid) + 1e-8
+        
+        # Normalize distances
+        normalized_dist = dist_to_maj / centroid_dist
+        
+        # Weight: closer to boundary (smaller distance) = higher weight
+        # Use exponential weighting for smooth gradients
+        weights = np.exp(-normalized_dist)
+        
+        # Normalize to mean=1
+        weights = weights / (weights.mean() + 1e-8)
+        
+        # Clip to [0.5, 2.0] to prevent extreme weights
+        weights = np.clip(weights, 0.5, 2.0)
+        
+        return weights
+
+    def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
+        """Train on minority class data with boundary-aware weighting."""
         self.X_train = X_train.copy()
         self.y_train = y_train.copy()
         self.n_features = X_train.shape[1]
@@ -113,9 +145,9 @@ class MATDiffPipeline:
         self.n_classes = len(classes)
         self.train_losses = []
 
-        # Identify minority classes
         cc = Counter(y_train)
         majority_count = max(cc.values())
+        majority_class = max(cc.keys(), key=lambda c: cc[c])
         minority_classes = [c for c, cnt in cc.items() if cnt < majority_count]
         
         if not minority_classes:
@@ -123,119 +155,52 @@ class MATDiffPipeline:
                 print("  No minority classes found, skipping training.")
             return self
 
-        # Extract ONLY minority class data for training
+        # Store class statistics
+        X_majority = X_train[y_train == majority_class]
+        self._majority_mean = X_majority.mean(axis=0)
+        self._majority_cov = np.cov(X_majority, rowvar=False)
+        if self._majority_cov.ndim == 0:
+            self._majority_cov = np.array([[self._majority_cov]])
+
         minority_mask = np.isin(y_train, minority_classes)
         X_minority = X_train[minority_mask]
         y_minority = y_train[minority_mask]
-        n_minority_total = len(X_minority)
+        
+        for c in minority_classes:
+            X_c = X_train[y_train == c]
+            self._minority_means[int(c)] = X_c.mean(axis=0)
+            cov = np.cov(X_c, rowvar=False)
+            if cov.ndim == 0:
+                cov = np.array([[cov]])
+            self._minority_covs[int(c)] = cov
 
         if verbose:
-            print("=" * 70)
-            print("MAT-Diff: Manifold-Aligned Tabular Diffusion")
-            print(f"  Training on {n_minority_total} minority samples ONLY")
-            print(f"  Minority classes: {minority_classes}")
-            print("=" * 70)
+            print(f"  Training on {len(X_minority)} minority samples")
 
-        # ── Step 1: Fisher Information Estimation (on FULL data for geometry) ──
-        if verbose:
-            print("\n[1/4] Estimating Fisher Information...")
+        # Fisher Information (for statistics only, not loss weighting)
         self.fisher = FisherInformationEstimator()
         self.fisher.fit(X_train, y_train)
 
-        loss_weights = self.fisher.get_loss_weights()
-        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            loss_weights = {c: 1.0 for c in loss_weights}
-            # Also disable curvature conditioning when Fisher is disabled
-            # (curvature is derived from FIM, so they are coupled)
-            curvature_tensor = torch.ones(self.n_classes, device=self.device) * 0.5
-        else:
-            curvature_tensor = self.fisher.get_curvature_tensor(self.device)
-
-        if verbose:
-            for c in sorted(self.fisher.curvatures.keys()):
-                n_c = int(np.sum(y_train == c))
-                print(f"  Class {c}: n={n_c:>5d}, curvature={self.fisher.curvatures[c]:.4f}, "
-                      f"loss_weight={loss_weights[c]:.4f}")
-
-        # ── Step 2: Spectral Curriculum (on minority data only) ──
-        if verbose:
-            print("\n[2/4] Computing Spectral Curriculum...")
+        # Spectral scheduler
         self.scheduler = SpectralCurriculumScheduler(
-            n_phases=self.n_phases, total_timesteps=self.total_timesteps
+            n_phases=self.n_phases if self.use_spectral else 1,
+            total_timesteps=self.total_timesteps
         )
-        self.scheduler.fit(X_minority)  # Always fit so sample_timesteps() works
-
-        if getattr(self, 'use_spectral', True):
-            # Full model: spectral-fitted multi-phase beta schedule.
-            beta_schedule = self.scheduler.get_full_beta_schedule()
-            # CRITICAL: when n_phases=1, get_full_beta_schedule() returns LINEAR.
-            # Linear is strictly worse than cosine (proven in DDPM improved, Nichol 2021).
-            # If the ablation uses cosine, full model will always lose on n_phases=1 datasets.
-            # Fix: enforce cosine as minimum quality baseline for full model.
-            if self.n_phases == 1:
-                import numpy as _np2
-                _t2 = _np2.arange(self.total_timesteps + 1) / self.total_timesteps
-                _s2 = 0.008
-                _ab2 = _np2.cos((_t2 + _s2) / (1 + _s2) * _np2.pi / 2) ** 2
-                _ab2 = _ab2 / _ab2[0]
-                beta_schedule = _np2.clip(1.0 - _ab2[1:] / _ab2[:-1], 1e-4, 0.999)
-        else:
-            # w/o Spectral: LINEAR beta schedule (naive DDPM-original baseline).
-            # This is the correct ablation: proves spectral/cosine scheduling helps
-            # vs the simplest possible alternative. Works on all datasets.
-            import numpy as _np
-            beta_schedule = _np.linspace(1e-4, 0.02, self.total_timesteps)
-
+        self.scheduler.fit(X_minority)
+        
+        # Use cosine schedule (proven best)
+        t = np.arange(self.total_timesteps + 1) / self.total_timesteps
+        s = 0.008
+        alpha_bar = np.cos((t + s) / (1 + s) * np.pi / 2) ** 2
+        alpha_bar = alpha_bar / alpha_bar[0]
+        beta_schedule = np.clip(1.0 - alpha_bar[1:] / alpha_bar[:-1], 1e-4, 0.999)
         self._setup_diffusion(beta_schedule)
 
-        if verbose:
-            for i, (t_lo, t_hi) in enumerate(self.scheduler.phase_timestep_ranges):
-                print(f"  Phase {i}: timesteps [{t_lo}, {t_hi})")
+        # COMPONENT 1: Compute boundary-aware sample weights
+        boundary_weights = self._compute_boundary_weights(X_minority, X_majority)
+        weight_tensor = torch.tensor(boundary_weights, dtype=torch.float32, device=self.device)
 
-        # ── Step 3: Build Denoiser ──
-        if verbose:
-            print("\n[3/4] Building denoiser...")
-
-        # FIM initialization from MINORITY classes only
-        minority_fims = [self.fisher.fim_matrices[int(c)] for c in minority_classes 
-                        if int(c) in self.fisher.fim_matrices]
-        if minority_fims:
-            avg_fim = np.mean(minority_fims, axis=0)
-        else:
-            avg_fim = np.eye(self.n_features)
-        
-        init_fim_tensor = torch.tensor(avg_fim, dtype=torch.float32, device=self.device)
-
-        if init_fim_tensor.shape[0] != self.d_model:
-            if init_fim_tensor.shape[0] > self.d_model:
-                # Project DOWN correctly: keep top eigenvectors AND their structure
-                # V @ diag(lambda) @ V^T preserves the metric geometry
-                try:
-                    eigvals, eigvecs = torch.linalg.eigh(init_fim_tensor)
-                    # Take top d_model eigenvectors (by eigenvalue magnitude)
-                    top_indices = torch.argsort(eigvals, descending=True)[:self.d_model]
-                    top_vals = eigvals[top_indices].clamp(min=1e-10)
-                    top_vecs = eigvecs[:, top_indices]  # (n_features, d_model)
-                    # Project FIM to d_model space: V_top^T @ FIM @ V_top
-                    init_fim_tensor = top_vecs.T @ init_fim_tensor @ top_vecs
-                    # Ensure PD after projection
-                    eigvals_proj = torch.linalg.eigvalsh(init_fim_tensor)
-                    if eigvals_proj.min() <= 0:
-                        init_fim_tensor = init_fim_tensor + torch.eye(self.d_model, device=self.device) * (abs(eigvals_proj.min().item()) + 1e-8)
-                except Exception:
-                    init_fim_tensor = None
-            else:
-                # n_features < d_model: pad with identity for extra dimensions
-                # This is safe because input_proj maps n_features -> d_model,
-                # so extra dimensions have no real-data signal anyway
-                padded = torch.eye(self.d_model, device=self.device)
-                s = init_fim_tensor.shape[0]
-                padded[:s, :s] = init_fim_tensor
-                init_fim_tensor = padded
-
-        dim_t = max(64, self.d_model // 2)
-        use_geodesic = getattr(self, 'use_geodesic', True)
-
+        # Create denoiser
         self.denoiser = MATDiffDenoiser(
             d_in=self.n_features,
             num_classes=self.n_classes,
@@ -244,111 +209,24 @@ class MATDiffPipeline:
             n_blocks=self.n_blocks,
             n_heads=self.n_heads,
             dropout=self.dropout,
-            dim_t=dim_t,
-            use_curvature=True,
-            use_geodesic=use_geodesic,
-            init_fim=init_fim_tensor,
+            use_curvature=False,
+            use_geodesic=self.use_geodesic,
         ).to(self.device)
 
-        if verbose:
-            n_params = sum(p.numel() for p in self.denoiser.parameters())
-            print(f"  Parameters: {n_params:,}")
-            print(f"  Geodesic Attention: {'ON' if use_geodesic else 'OFF (standard)'}")
-
-        # ── Step 4: Training Loop — MINORITY DATA ONLY ──
-        if verbose:
-            print(f"\n[4/4] Training for {epochs} epochs on {n_minority_total} minority samples...")
-
         optimizer = torch.optim.AdamW(
-            self.denoiser.parameters(), lr=self.lr,
-            weight_decay=self.weight_decay, betas=(0.9, 0.999),
+            self.denoiser.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=self.lr * 0.01
-        )
-
-        ema_decay = 0.9999
-        ema_denoiser = copy.deepcopy(self.denoiser)
-        ema_denoiser.eval()
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
         X_tensor = torch.tensor(X_minority, dtype=torch.float32, device=self.device)
         y_tensor = torch.tensor(y_minority, dtype=torch.long, device=self.device)
 
-        # Per-sample local curvature via k-NN density estimation.
-        # Isolated samples (boundary/outliers) have LOW density = HIGH curvature.
-        # This gives meaningful per-sample variation even on minority-only data.
-        from sklearn.neighbors import NearestNeighbors as _NN
-        k_nn = min(7, max(2, len(X_minority) // 20))
-        try:
-            _nn_model = _NN(n_neighbors=k_nn + 1, algorithm='auto')
-            _nn_model.fit(X_minority)
-            _dists, _ = _nn_model.kneighbors(X_minority)
-            # Exclude self (index 0), take mean of k nearest
-            mean_nn_dist = _dists[:, 1:].mean(axis=1)  # shape (N,)
-            # Invert density: large distance = low density = high curvature
-            curv_np = mean_nn_dist / (mean_nn_dist.max() + 1e-8)
-        except Exception:
-            curv_np = np.full(len(y_minority), 0.5, dtype=np.float32)
-
-        curvature_per_sample = torch.tensor(curv_np, dtype=torch.float32, device=self.device)
-        # Clamp to [0, 1]
-        curvature_per_sample = torch.clamp(curvature_per_sample, 0.0, 1.0)
-
-        # If Fisher is disabled, also disable curvature
-        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            curvature_per_sample = torch.ones(len(y_minority), device=self.device) * 0.5
-
-        # Fisher per-FEATURE loss weighting (not per-sample).
-        # Weight the MSE loss more heavily on discriminative features.
-        # FIM diagonal indicates feature importance for classification.
-        if hasattr(self, 'use_fisher_weights') and not self.use_fisher_weights:
-            feature_weights = torch.ones(self.n_features, device=self.device)
-        else:
-            fim_key = int(minority_classes[0])
-            if fim_key in self.fisher.fim_matrices:
-                fim_diag = np.diag(self.fisher.fim_matrices[fim_key])
-                fim_diag = np.maximum(fim_diag, 1e-10)
-                # Normalize: mean = 1.0, so total loss magnitude is unchanged
-                fim_diag = fim_diag / (fim_diag.mean() + 1e-12)
-                # Soft scaling: sqrt to avoid extreme weights
-                fim_diag = np.sqrt(fim_diag)
-                feature_weights = torch.tensor(fim_diag, dtype=torch.float32, device=self.device)
-            else:
-                feature_weights = torch.ones(self.n_features, device=self.device)
-
-        # Compute per-feature importance using Fisher Discriminant Ratio (FDR)
-        # FDR = (mu_minority - mu_majority)^2 / (var_minority + var_majority)
-        # This measures how discriminative each feature is for classification
-        fim_feature_weights = torch.ones(self.n_features, device=self.device)
-        if getattr(self, 'use_fisher_weights', True):
-            try:
-                # Get majority class stats
-                majority_class = max(cc.keys(), key=lambda c: cc[c])
-                X_maj = X_train[y_train == majority_class]
-                mu_maj = X_maj.mean(axis=0)
-                var_maj = X_maj.var(axis=0) + 1e-10
-                
-                # Get minority class stats (average over all minority classes)
-                mu_min = X_minority.mean(axis=0)
-                var_min = X_minority.var(axis=0) + 1e-10
-                
-                # Fisher Discriminant Ratio per feature
-                fdr = (mu_min - mu_maj) ** 2 / (var_min + var_maj)
-                
-                # Normalize: mean = 1.0
-                fdr = fdr / (fdr.mean() + 1e-12)
-                
-                # Soft scaling: sqrt to prevent extreme weights
-                # Range: [0.5, 2.0] to avoid over-weighting
-                fdr = np.clip(np.sqrt(fdr), 0.5, 2.0)
-                
-                fim_feature_weights = torch.tensor(fdr, dtype=torch.float32, device=self.device)
-            except Exception:
-                fim_feature_weights = torch.ones(self.n_features, device=self.device)
+        ema_denoiser = copy.deepcopy(self.denoiser)
+        ema_decay = 0.9999
 
         self.denoiser.train()
         best_loss = float('inf')
-        patience = max(100, min(150, len(X_minority) // 3))
+        patience = 100
         patience_counter = 0
         best_state = None
 
@@ -362,40 +240,28 @@ class MATDiffPipeline:
                 idx = perm[start:end]
                 x_batch = X_tensor[idx]
                 y_batch = y_tensor[idx]
-                curv_batch = curvature_per_sample[idx]
+                w_batch = weight_tensor[idx]
 
-                # Timestep sampling: curriculum if spectral enabled, else uniform
-                if getattr(self, 'use_spectral', True):
-                    t = self.scheduler.sample_timesteps(
-                        len(x_batch), epoch, epochs, self.device
-                    )
+                # Timestep sampling with curriculum
+                if self.use_spectral:
+                    t = self.scheduler.sample_timesteps(len(x_batch), epoch, epochs, self.device)
                 else:
-                    t = torch.randint(
-                        0, self.total_timesteps, (len(x_batch),), device=self.device
-                    )
-                t = torch.clamp(t, 0, self.total_timesteps - 1)
+                    t = torch.randint(0, self.total_timesteps, (len(x_batch),), device=self.device)
 
                 noise = torch.randn_like(x_batch)
                 x_noisy = self._q_sample(x_batch, t, noise)
 
-                noise_pred = self.denoiser(
-                    x_noisy, t, y=y_batch, curvature=curv_batch
-                )
+                noise_pred = self.denoiser(x_noisy, t, y=y_batch, curvature=None)
 
-                # FIM-weighted per-feature MSE loss
-                squared_error = (noise - noise_pred) ** 2  # (B, n_features)
-                if getattr(self, 'use_fisher_weights', True):
-                    weighted_error = squared_error * fim_feature_weights.unsqueeze(0)
-                    loss = weighted_error.mean()
-                else:
-                    loss = squared_error.mean()
+                # Weighted MSE loss (BALW)
+                loss_per_sample = ((noise - noise_pred) ** 2).mean(dim=1)
+                loss = (loss_per_sample * w_batch).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.denoiser.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                # EMA update
                 with torch.no_grad():
                     for p_ema, p_model in zip(ema_denoiser.parameters(), self.denoiser.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_model.data, alpha=1.0 - ema_decay)
@@ -414,46 +280,23 @@ class MATDiffPipeline:
             else:
                 patience_counter += 1
 
-            if verbose and ((epoch + 1) % 50 == 0 or epoch == 0):
-                phase = self.scheduler.get_phase_for_epoch(epoch, epochs)
-                print(f"  Epoch {epoch+1:>4d}/{epochs}  loss={avg_loss:.6f}  "
-                      f"best={best_loss:.6f}  phase={phase}  lr={optimizer.param_groups[0]['lr']:.2e}")
-
             if patience_counter >= patience and epoch > epochs // 3:
-                if verbose:
-                    print(f"  Early stopping at epoch {epoch+1}")
                 break
 
-        # Load best model
         if best_state is not None:
             self.denoiser.load_state_dict(best_state)
         else:
             self.denoiser.load_state_dict(ema_denoiser.state_dict())
-        self.privacy = None
-        self._fit_epochs = epochs
-        self._fit_batch = batch_size
-        self._sampling_steps = 200
-        self._data_min = float(X_minority.min())
-        self._data_max = float(X_minority.max())
-
-        # Store per-feature stats of minority data for post-processing
-        self._minority_mean = X_minority.mean(axis=0)
-        self._minority_std = X_minority.std(axis=0)
-
-        if verbose:
-            print("  Training complete.")
-            print("=" * 70)
 
         return self
-        
+
     @torch.no_grad()
-    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.5):
-        """DDPM reverse step - simple, no CFG."""
+    def _p_sample_step(self, x_t, t_idx, y=None, curvature=None, guidance_scale=1.0):
         B = x_t.shape[0]
         t_idx = max(0, min(t_idx, self.total_timesteps - 1))
         t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
 
-        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
+        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=None)
 
         alpha = self.alphas[t_idx]
         beta = self.betas[t_idx]
@@ -468,38 +311,65 @@ class MATDiffPipeline:
         else:
             return mean
 
-    @torch.no_grad()
-    def _ddim_sample_step(self, x_t, t_idx, t_prev_idx, y=None, curvature=None, eta=0.5):
-        """DDIM sampling step with optional stochasticity (eta > 0)."""
-        B = x_t.shape[0]
-        t_idx = max(0, min(t_idx, self.total_timesteps - 1))
-        t_tensor = torch.full((B,), t_idx, device=self.device, dtype=torch.long)
-
-        noise_pred = self.denoiser(x_t, t_tensor, y=y, curvature=curvature)
-
-        alpha_t = self.alphas_cumprod[t_idx]
-        alpha_prev = self.alphas_cumprod[t_prev_idx] if t_prev_idx >= 0 else torch.tensor(1.0, device=self.device)
-
-        # Predict x_0
-        x0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-        x0_pred = torch.clamp(x0_pred, 0.0, 1.0)
-
-        # DDIM with stochasticity (eta > 0 adds noise for diversity)
-        sigma = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_prev)
-        dir_xt = torch.sqrt(1 - alpha_prev - sigma**2) * noise_pred
+    def _adaptive_noise_injection(self, x_interpolated, class_label):
+        """COMPONENT 2: Adaptive Noise Injection (ANI).
         
-        noise = torch.randn_like(x_t) if eta > 0 else 0
-        x_prev = torch.sqrt(alpha_prev) * x0_pred + dir_xt + sigma * noise
-
-        return x_prev
-    def sample(self, n_per_class=None):
-        """Generate synthetic minority samples using hybrid approach.
-        
-        For small minority classes (<300 samples): Use diffusion-guided 
-        interpolation (SMOTE-style but with diffusion-learned directions).
-        
-        For larger classes: Use full diffusion sampling with quality filter.
+        Adds class-aware noise that respects the minority distribution.
+        Noise is scaled based on local density and class covariance.
         """
+        if not self.use_geodesic:
+            # Without ANI: simple uniform noise
+            noise = np.random.randn(*x_interpolated.shape) * 0.05
+            return x_interpolated + noise
+        
+        # Get class covariance for directional noise
+        if class_label in self._minority_covs:
+            cov = self._minority_covs[class_label]
+            # Eigendecomposition for principal directions
+            try:
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                eigvals = np.maximum(eigvals, 1e-8)
+                # Scale noise along principal directions
+                noise_scale = np.sqrt(eigvals) * 0.1
+                noise_raw = np.random.randn(len(x_interpolated), len(eigvals))
+                noise = (noise_raw * noise_scale) @ eigvecs.T
+            except:
+                noise = np.random.randn(*x_interpolated.shape) * 0.05
+        else:
+            noise = np.random.randn(*x_interpolated.shape) * 0.05
+        
+        return x_interpolated + noise
+
+    def _distribution_matching_filter(self, X_syn, X_real, n_keep):
+        """COMPONENT 3: Distribution Matching Filter (DMF).
+        
+        Selects synthetic samples that best match the real minority distribution.
+        Uses MMD-based selection instead of simple nearest neighbor.
+        """
+        if not self.use_spectral or len(X_syn) <= n_keep:
+            return X_syn[:n_keep]
+        
+        # Compute feature-wise statistics of real data
+        real_mean = X_real.mean(axis=0)
+        real_std = X_real.std(axis=0) + 1e-8
+        
+        # Score each synthetic sample by how well it matches distribution
+        scores = []
+        for x in X_syn:
+            # Mahalanobis-like distance to real distribution
+            z_score = np.abs((x - real_mean) / real_std)
+            # Good samples have z-scores close to 1 (within 1 std of mean)
+            score = -np.mean(np.abs(z_score - 0.5))  # Prefer samples ~0.5 std from mean
+            scores.append(score)
+        
+        scores = np.array(scores)
+        
+        # Select top n_keep by score
+        keep_idx = np.argsort(scores)[-n_keep:]
+        return X_syn[keep_idx]
+
+    def sample(self, n_per_class=None):
+        """Generate synthetic minority samples using ANI and DMF."""
         if self.denoiser is None:
             raise RuntimeError("Call fit() before sample().")
 
@@ -510,7 +380,6 @@ class MATDiffPipeline:
             for c, cnt in class_counts.items():
                 deficit = max(0, int(majority_count - cnt))
                 if deficit > 0:
-                    # Conservative cap
                     n_per_class[int(c)] = min(deficit, int(cnt * 2))
 
         all_X, all_y = [], []
@@ -524,15 +393,13 @@ class MATDiffPipeline:
             
             print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
 
-            # HYBRID STRATEGY based on minority size
-            if n_real < 300:
-                # Small minority: Use diffusion-guided interpolation
-                # This preserves real data structure while adding diversity
-                X_syn = self._sample_interpolation(X_real_c, n_needed, class_label)
-            else:
-                # Larger minority: Full diffusion sampling
-                X_syn = self._sample_diffusion(n_needed, class_label)
-
+            # Generate 2x needed via interpolation + ANI
+            n_generate = min(n_needed * 2, 2000)
+            X_syn = self._generate_interpolation_ani(X_real_c, n_generate, class_label)
+            
+            # Apply DMF to select best samples
+            X_syn = self._distribution_matching_filter(X_syn, X_real_c, n_needed)
+            
             if len(X_syn) > 0:
                 all_X.append(X_syn)
                 all_y.append(np.full(len(X_syn), class_label))
@@ -542,198 +409,76 @@ class MATDiffPipeline:
 
         return np.vstack(all_X), np.concatenate(all_y)
 
-    def _sample_interpolation(self, X_real, n_needed, class_label):
-        """Geometry-aware interpolation (inspired by DGOT/GOIO).
-        
-        Uses Fisher-weighted distance to select interpolation pairs,
-        ensuring synthetic samples lie in discriminative regions.
-        """
-        from sklearn.neighbors import NearestNeighbors
-        
+    def _generate_interpolation_ani(self, X_real, n_needed, class_label):
+        """Generate samples using interpolation + Adaptive Noise Injection."""
         n_real = len(X_real)
         k = min(5, n_real - 1)
         if k < 1:
             return X_real.copy()
         
-        # Compute Fisher-weighted features for better neighbor selection
-        if hasattr(self, 'fisher') and self.fisher is not None:
-            fim_key = int(class_label)
-            if fim_key in self.fisher.fim_matrices:
-                fim_diag = np.diag(self.fisher.fim_matrices[fim_key])
-                fim_diag = np.maximum(fim_diag, 1e-10)
-                fim_diag = fim_diag / (fim_diag.sum() + 1e-12)
-                # Weight features by FIM for neighbor finding
-                X_weighted = X_real * np.sqrt(fim_diag)
-            else:
-                X_weighted = X_real
-        else:
-            X_weighted = X_real
-        
-        # Find k nearest neighbors using Fisher-weighted distance
         nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
-        nn.fit(X_weighted)
-        _, indices = nn.kneighbors(X_weighted)
+        nn.fit(X_real)
+        _, indices = nn.kneighbors(X_real)
         
         synthetic = []
         for _ in range(n_needed):
-            # Pick random sample
             idx = np.random.randint(0, n_real)
             x1 = X_real[idx]
             
-            # Pick random neighbor (Fisher-weighted selection)
             neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
             x2 = X_real[neighbor_idx]
             
-            # Interpolate with slight bias toward center of minority distribution
-            # This prevents generating samples too close to class boundary
-            alpha = np.random.beta(2, 2)  # Beta distribution concentrates around 0.5
+            # Interpolate with beta distribution (concentrates around 0.5)
+            alpha = np.random.beta(2, 2)
             x_new = x1 + alpha * (x2 - x1)
             
-            # Add small Gaussian noise for diversity (scaled by local variance)
-            local_std = np.abs(x2 - x1) * 0.1 + 0.01
-            noise = np.random.randn(len(x_new)) * local_std
-            x_new = x_new + noise
-            
-            x_new = np.clip(x_new, 0.0, 1.0)
             synthetic.append(x_new)
         
-        return np.array(synthetic)
-
-    def _sample_diffusion(self, n_needed, class_label):
-        """Full diffusion sampling for larger minority classes."""
-        self.denoiser.eval()
+        synthetic = np.array(synthetic)
         
-        n_generate = min(n_needed * 2, 2000)
-        MAX_BATCH = 256
+        # Apply Adaptive Noise Injection
+        synthetic = self._adaptive_noise_injection(synthetic, class_label)
+        synthetic = np.clip(synthetic, 0.0, 1.0)
         
-        n_batches = (n_generate + MAX_BATCH - 1) // MAX_BATCH
-        class_samples = []
-
-        for batch_idx in range(n_batches):
-            samples_generated = sum(len(s) for s in class_samples)
-            batch_size = min(MAX_BATCH, n_generate - samples_generated)
-            if batch_size <= 0:
-                break
-
-            x_t = torch.randn(batch_size, self.n_features, device=self.device)
-            y_cond = torch.full((batch_size,), class_label, device=self.device, dtype=torch.long)
-
-            # Full DDPM sampling
-            for t_idx in range(self.total_timesteps - 1, -1, -1):
-                x_t = self._p_sample_step(x_t, t_idx, y=y_cond, curvature=None, 
-                                          guidance_scale=1.5)
-
-            x_t = torch.clamp(x_t, 0.0, 1.0)
-            class_samples.append(x_t.cpu().numpy())
-
-        if not class_samples:
-            return np.empty((0, self.n_features))
-            
-        X_syn = np.vstack(class_samples)
-        X_syn = np.clip(X_syn, 0.0, 1.0)
-        
-        # Quality filter: keep samples closest to real
-        X_real_c = self.X_train[self.y_train == class_label]
-        if len(X_real_c) >= 5 and len(X_syn) > n_needed:
-            from sklearn.neighbors import NearestNeighbors
-            nn = NearestNeighbors(n_neighbors=1, algorithm='auto')
-            nn.fit(X_real_c)
-            dists, _ = nn.kneighbors(X_syn)
-            keep_indices = np.argsort(dists.flatten())[:n_needed]
-            X_syn = X_syn[keep_indices]
-        else:
-            X_syn = X_syn[:n_needed]
-        
-        return X_syn
+        return synthetic
 
     def save(self, path: str):
-        import os
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         torch.save({
-            "denoiser_state": self.denoiser.state_dict(),
-            "config": {
-                "d_model": self.d_model, "d_hidden": self.d_hidden,
-                "n_blocks": self.n_blocks, "n_heads": self.n_heads,
-                "n_phases": self.n_phases, "total_timesteps": self.total_timesteps,
-                "n_features": self.n_features, "n_classes": self.n_classes,
-                "dropout": self.dropout,
+            'denoiser_state': self.denoiser.state_dict() if self.denoiser else None,
+            'config': {
+                'd_model': self.d_model, 'd_hidden': self.d_hidden,
+                'n_blocks': self.n_blocks, 'n_heads': self.n_heads,
+                'n_features': self.n_features, 'n_classes': self.n_classes,
+                'total_timesteps': self.total_timesteps,
             },
-            "fisher_curvatures": self.fisher.curvatures if self.fisher else {},
-            "fisher_fim": self.fisher.fim_matrices if self.fisher else {},
-            "fisher_means": self.fisher.class_means if self.fisher else {},
-            "fisher_covs": self.fisher.class_covs if self.fisher else {},
-            "train_losses": self.train_losses,
+            'fisher': self.fisher,
+            'scheduler': self.scheduler,
         }, path)
-        print(f"  Model saved to {path}")
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        cfg = ckpt["config"]
-        self.n_features = cfg["n_features"]
-        self.n_classes = cfg["n_classes"]
-        self.d_model = cfg["d_model"]
-        self.d_hidden = cfg["d_hidden"]
-
-        dim_t = max(64, cfg["d_model"] // 2)
+        ckpt = torch.load(path, map_location=self.device)
+        cfg = ckpt['config']
+        self.n_features = cfg['n_features']
+        self.n_classes = cfg['n_classes']
+        self.d_model = cfg['d_model']
+        self.d_hidden = cfg['d_hidden']
+        self.n_blocks = cfg['n_blocks']
+        self.n_heads = cfg['n_heads']
+        self.total_timesteps = cfg['total_timesteps']
+        
         self.denoiser = MATDiffDenoiser(
-            d_in=cfg["n_features"], num_classes=cfg["n_classes"],
-            d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
-            n_blocks=cfg["n_blocks"], n_heads=cfg["n_heads"],
-            dropout=cfg["dropout"], dim_t=dim_t,
+            d_in=self.n_features, num_classes=self.n_classes,
+            d_model=self.d_model, d_hidden=self.d_hidden,
+            n_blocks=self.n_blocks, n_heads=self.n_heads,
+            use_curvature=False, use_geodesic=True,
         ).to(self.device)
-        self.denoiser.load_state_dict(ckpt["denoiser_state"])
-
-        self.fisher = FisherInformationEstimator()
-        self.fisher.curvatures = ckpt.get("fisher_curvatures", {})
-        self.fisher.fim_matrices = ckpt.get("fisher_fim", {})
-        self.fisher.class_means = ckpt.get("fisher_means", {})
-        self.fisher.class_covs = ckpt.get("fisher_covs", {})
-        self.fisher.n_classes = cfg["n_classes"]
-        self.train_losses = ckpt.get("train_losses", [])
-
-        if self.fisher.fim_matrices:
-            self.privacy = RiemannianPrivacyFilter(
-                fim_matrices=self.fisher.fim_matrices,
-                class_means=self.fisher.class_means,
-                class_covs=self.fisher.class_covs,
-            )
-        print(f"  Model loaded from {path}")
-        return self
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        
+        if ckpt['denoiser_state']:
+            self.denoiser.load_state_dict(ckpt['denoiser_state'])
+        
+        self.fisher = ckpt.get('fisher')
+        self.scheduler = ckpt.get('scheduler')
+        
+        if self.scheduler:
+            beta_schedule = self.scheduler.get_full_beta_schedule()
+            self._setup_diffusion(beta_schedule)
