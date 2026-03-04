@@ -105,34 +105,34 @@ class MATDiffPipeline:
     def _compute_boundary_weights(self, X_minority, X_majority):
         """COMPONENT 1: Boundary-Aware Loss Weighting (BALW).
         
-        Samples closer to majority class centroid (boundary region) get higher weight.
-        This focuses training on the critical decision boundary.
+        Weights minority samples based on their difficulty:
+        - Samples far from minority centroid (outliers) = harder = higher weight
+        - Samples close to minority centroid (typical) = easier = lower weight
+        
+        This focuses training on hard-to-model boundary/outlier samples.
         """
         if not self.use_fisher_weights:
             return np.ones(len(X_minority))
         
-        # Compute majority centroid
-        maj_centroid = X_majority.mean(axis=0)
+        # Compute minority centroid
         min_centroid = X_minority.mean(axis=0)
         
-        # Distance from each minority sample to majority centroid
-        dist_to_maj = np.linalg.norm(X_minority - maj_centroid, axis=1)
+        # Distance from each minority sample to its own centroid
+        dist_to_min_centroid = np.linalg.norm(X_minority - min_centroid, axis=1)
         
-        # Reference: distance between class centroids
-        centroid_dist = np.linalg.norm(min_centroid - maj_centroid) + 1e-8
+        # Median distance as reference (robust to outliers)
+        median_dist = np.median(dist_to_min_centroid) + 1e-8
         
         # Normalize distances
-        normalized_dist = dist_to_maj / centroid_dist
+        normalized_dist = dist_to_min_centroid / median_dist
         
-        # Weight: closer to boundary (smaller distance) = higher weight
-        # Use exponential weighting for smooth gradients
-        weights = np.exp(-normalized_dist)
+        # Weight: farther from centroid (harder sample) = higher weight
+        # Samples at median distance get weight ~1.0
+        # Samples 2x median distance get weight ~1.5
+        weights = 1.0 + 0.5 * (normalized_dist - 1.0)
         
-        # Normalize to mean=1
-        weights = weights / (weights.mean() + 1e-8)
-        
-        # Clip to [0.5, 2.0] to prevent extreme weights
-        weights = np.clip(weights, 0.5, 2.0)
+        # Clip to [0.7, 1.5] to prevent extreme weights
+        weights = np.clip(weights, 0.7, 1.5)
         
         return weights
 
@@ -314,57 +314,63 @@ class MATDiffPipeline:
     def _adaptive_noise_injection(self, x_interpolated, class_label):
         """COMPONENT 2: Adaptive Noise Injection (ANI).
         
-        Adds class-aware noise that respects the minority distribution.
-        Noise is scaled based on local density and class covariance.
+        WITHOUT ANI (use_geodesic=False): No noise added (pure SMOTE)
+        WITH ANI (use_geodesic=True): Covariance-aligned noise for diversity
         """
         if not self.use_geodesic:
-            # Without ANI: simple uniform noise
-            noise = np.random.randn(*x_interpolated.shape) * 0.05
-            return x_interpolated + noise
+            # Without ANI: NO noise (pure interpolation like SMOTE)
+            return x_interpolated
         
-        # Get class covariance for directional noise
+        # WITH ANI: Add covariance-aligned noise
         if class_label in self._minority_covs:
             cov = self._minority_covs[class_label]
-            # Eigendecomposition for principal directions
             try:
+                # Eigendecomposition for principal directions
                 eigvals, eigvecs = np.linalg.eigh(cov)
                 eigvals = np.maximum(eigvals, 1e-8)
-                # Scale noise along principal directions
-                noise_scale = np.sqrt(eigvals) * 0.1
+                # Scale noise along principal directions (0.15 scale factor)
+                noise_scale = np.sqrt(eigvals) * 0.15
                 noise_raw = np.random.randn(len(x_interpolated), len(eigvals))
                 noise = (noise_raw * noise_scale) @ eigvecs.T
             except:
-                noise = np.random.randn(*x_interpolated.shape) * 0.05
+                # Fallback: isotropic noise scaled by feature std
+                noise = np.random.randn(*x_interpolated.shape) * 0.08
         else:
-            noise = np.random.randn(*x_interpolated.shape) * 0.05
+            noise = np.random.randn(*x_interpolated.shape) * 0.08
         
         return x_interpolated + noise
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
         """COMPONENT 3: Distribution Matching Filter (DMF).
         
-        Selects synthetic samples that best match the real minority distribution.
-        Uses MMD-based selection instead of simple nearest neighbor.
+        WITHOUT DMF (use_spectral=False): Random selection
+        WITH DMF (use_spectral=True): Select samples matching real distribution
         """
-        if not self.use_spectral or len(X_syn) <= n_keep:
-            return X_syn[:n_keep]
+        if len(X_syn) <= n_keep:
+            return X_syn
         
-        # Compute feature-wise statistics of real data
+        if not self.use_spectral:
+            # Without DMF: random selection
+            idx = np.random.choice(len(X_syn), n_keep, replace=False)
+            return X_syn[idx]
+        
+        # WITH DMF: Select samples closest to real distribution
         real_mean = X_real.mean(axis=0)
         real_std = X_real.std(axis=0) + 1e-8
         
-        # Score each synthetic sample by how well it matches distribution
+        # Score each synthetic sample
         scores = []
         for x in X_syn:
-            # Mahalanobis-like distance to real distribution
-            z_score = np.abs((x - real_mean) / real_std)
-            # Good samples have z-scores close to 1 (within 1 std of mean)
-            score = -np.mean(np.abs(z_score - 0.5))  # Prefer samples ~0.5 std from mean
+            # Z-score relative to real distribution
+            z = (x - real_mean) / real_std
+            # Prefer samples within 1.5 std of mean (typical minority samples)
+            # Penalize samples too close to mean (mode collapse) or too far (outliers)
+            z_abs = np.abs(z)
+            # Ideal z-score is around 0.5-1.0 (between mean and 1 std)
+            score = -np.mean((z_abs - 0.7) ** 2)
             scores.append(score)
         
         scores = np.array(scores)
-        
-        # Select top n_keep by score
         keep_idx = np.argsort(scores)[-n_keep:]
         return X_syn[keep_idx]
 
@@ -482,3 +488,4 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
