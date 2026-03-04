@@ -469,11 +469,11 @@ class MATDiffPipeline:
         
         synthetic = np.array(synthetic)
         
-        # Apply light diffusion refinement (use trained model!)
-        if self.use_geodesic and self.denoiser is not None:
+        # Always apply diffusion refinement (core model contribution)
+        if self.denoiser is not None:
             synthetic = self._diffusion_refine(synthetic, class_label)
         
-        # Apply Adaptive Noise Injection
+        # Apply Adaptive Noise Injection (ANI component - ablatable)
         synthetic = self._adaptive_noise_injection(synthetic, class_label)
         synthetic = np.clip(synthetic, 0.0, 1.0)
         
@@ -553,6 +553,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
