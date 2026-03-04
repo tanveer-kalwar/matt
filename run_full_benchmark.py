@@ -986,7 +986,21 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             use_spectral = True  
             n_phases = cfg["n_phases"]
 
-            # Configure variant flags
+            # Create pipeline for this variant
+            pipeline = MATDiffPipeline(
+                device=device,
+                d_model=cfg["d_model"],
+                d_hidden=cfg.get("d_hidden", cfg["d_model"] * 2),
+                n_blocks=cfg["n_blocks"],
+                n_heads=cfg["n_heads"],
+                n_phases=cfg.get("n_phases", 3),
+                total_timesteps=cfg.get("total_timesteps", 1000),
+                dropout=cfg.get("dropout", 0.1),
+                lr=cfg["lr"],
+                privacy_quantile=cfg.get("privacy_quantile", 0.05),
+            )
+            
+            # Configure variant flags BEFORE training
             if variant_name == "w/o Fisher":
                 pipeline.use_fisher_weights = False
                 pipeline.use_geodesic = True
@@ -1275,6 +1289,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
