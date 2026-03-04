@@ -105,33 +105,44 @@ class MATDiffPipeline:
     def _compute_boundary_weights(self, X_minority, X_majority):
         """COMPONENT 1: Boundary-Aware Loss Weighting (BALW).
         
-        Weights minority samples based on their difficulty:
-        - Samples far from minority centroid (outliers) = harder = higher weight
-        - Samples close to minority centroid (typical) = easier = lower weight
+        Weights minority samples based on proximity to decision boundary:
+        - Samples near majority (boundary) = harder = higher weight
+        - Samples far from majority (interior) = easier = lower weight
         
-        This focuses training on hard-to-model boundary/outlier samples.
+        Uses k-NN distance to majority class to identify boundary samples.
         """
         if not self.use_fisher_weights:
             return np.ones(len(X_minority))
         
-        # Compute minority centroid
-        min_centroid = X_minority.mean(axis=0)
+        # Use k-NN distance to majority class as boundary indicator
+        k = min(5, len(X_majority) - 1)
+        if k < 1:
+            return np.ones(len(X_minority))
         
-        # Distance from each minority sample to its own centroid
-        dist_to_min_centroid = np.linalg.norm(X_minority - min_centroid, axis=1)
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=k, algorithm='auto')
+        nn.fit(X_majority)
         
-        # Median distance as reference (robust to outliers)
-        median_dist = np.median(dist_to_min_centroid) + 1e-8
+        # Distance to k nearest majority samples
+        dists, _ = nn.kneighbors(X_minority)
+        mean_dist = dists.mean(axis=1)
         
-        # Normalize distances
-        normalized_dist = dist_to_min_centroid / median_dist
+        # Median distance as reference
+        median_dist = np.median(mean_dist) + 1e-8
         
-        # Weight: farther from centroid (harder sample) = higher weight
-        # Samples at median distance get weight ~1.0
-        # Samples 2x median distance get weight ~1.5
-        weights = 1.0 + 0.5 * (normalized_dist - 1.0)
+        # Normalize: samples closer to majority get higher weight
+        # ratio < 1 means closer to majority (boundary)
+        # ratio > 1 means farther from majority (interior)
+        ratio = mean_dist / median_dist
         
-        # Clip to [0.7, 1.5] to prevent extreme weights
+        # Weight: closer to majority (smaller ratio) = higher weight
+        # exp(-x) gives smooth decay, x=0 -> 1, x=1 -> 0.37
+        weights = 1.0 + 0.5 * np.exp(-ratio)
+        
+        # Normalize so mean = 1
+        weights = weights / (weights.mean() + 1e-8)
+        
+        # Clip to [0.7, 1.5]
         weights = np.clip(weights, 0.7, 1.5)
         
         return weights
@@ -488,4 +499,5 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
