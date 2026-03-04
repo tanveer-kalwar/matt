@@ -105,45 +105,50 @@ class MATDiffPipeline:
     def _compute_boundary_weights(self, X_minority, X_majority):
         """COMPONENT 1: Boundary-Aware Loss Weighting (BALW).
         
-        Weights minority samples based on proximity to decision boundary:
-        - Samples near majority (boundary) = harder = higher weight
-        - Samples far from majority (interior) = easier = lower weight
+        Adaptive weighting based on minority sample size:
+        - Small minority (<300): Uniform weights (avoid overfitting to noise)
+        - Large minority (>=300): Density-based weights (focus on core patterns)
         
-        Uses k-NN distance to majority class to identify boundary samples.
+        This prevents overfitting on small datasets while still providing
+        benefit on larger ones where density estimation is reliable.
         """
         if not self.use_fisher_weights:
             return np.ones(len(X_minority))
         
-        # Use k-NN distance to majority class as boundary indicator
-        k = min(5, len(X_majority) - 1)
-        if k < 1:
-            return np.ones(len(X_minority))
+        n_minority = len(X_minority)
         
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=k, algorithm='auto')
-        nn.fit(X_majority)
+        # For small minorities, ANY weighting scheme is unreliable
+        # The variance in density estimates dominates the signal
+        if n_minority < 300:
+            # Use VERY mild weighting: just slightly down-weight extreme outliers
+            # Compute distance to centroid
+            centroid = X_minority.mean(axis=0)
+            dists = np.linalg.norm(X_minority - centroid, axis=1)
+            
+            # Only down-weight samples > 2 std from centroid (extreme outliers)
+            std_dist = np.std(dists) + 1e-8
+            mean_dist = np.mean(dists)
+            z_scores = (dists - mean_dist) / std_dist
+            
+            # Mild down-weighting: samples > 2 std get 0.8 weight
+            weights = np.where(z_scores > 2.0, 0.85, 1.0)
+            return weights
         
-        # Distance to k nearest majority samples
+        # For larger minorities, use density-based weighting
+        k = min(10, n_minority - 1)
+        nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
+        nn.fit(X_minority)
+        
         dists, _ = nn.kneighbors(X_minority)
-        mean_dist = dists.mean(axis=1)
+        mean_dist = dists[:, 1:].mean(axis=1)
         
-        # Median distance as reference
         median_dist = np.median(mean_dist) + 1e-8
-        
-        # Normalize: samples closer to majority get higher weight
-        # ratio < 1 means closer to majority (boundary)
-        # ratio > 1 means farther from majority (interior)
         ratio = mean_dist / median_dist
         
-        # Weight: closer to majority (smaller ratio) = higher weight
-        # exp(-x) gives smooth decay, x=0 -> 1, x=1 -> 0.37
-        weights = 1.0 + 0.5 * np.exp(-ratio)
-        
-        # Normalize so mean = 1
+        # Smooth weighting
+        weights = 1.0 / (0.5 + 0.5 * ratio)
         weights = weights / (weights.mean() + 1e-8)
-        
-        # Clip to [0.7, 1.5]
-        weights = np.clip(weights, 0.7, 1.5)
+        weights = np.clip(weights, 0.7, 1.3)
         
         return weights
 
@@ -365,24 +370,30 @@ class MATDiffPipeline:
             idx = np.random.choice(len(X_syn), n_keep, replace=False)
             return X_syn[idx]
         
-        # WITH DMF: Select samples closest to real distribution
+        # WITH DMF: Use Mahalanobis distance to real distribution
         real_mean = X_real.mean(axis=0)
-        real_std = X_real.std(axis=0) + 1e-8
+        real_cov = np.cov(X_real, rowvar=False)
+        if real_cov.ndim == 0:
+            real_cov = np.array([[real_cov]])
         
-        # Score each synthetic sample
+        # Regularize covariance
+        real_cov = real_cov + np.eye(real_cov.shape[0]) * 1e-6
+        
+        try:
+            cov_inv = np.linalg.inv(real_cov)
+        except:
+            # Fallback to diagonal
+            cov_inv = np.diag(1.0 / (np.diag(real_cov) + 1e-8))
+        
+        # Mahalanobis distance: lower = closer to real distribution
         scores = []
         for x in X_syn:
-            # Z-score relative to real distribution
-            z = (x - real_mean) / real_std
-            # Prefer samples within 1.5 std of mean (typical minority samples)
-            # Penalize samples too close to mean (mode collapse) or too far (outliers)
-            z_abs = np.abs(z)
-            # Ideal z-score is around 0.5-1.0 (between mean and 1 std)
-            score = -np.mean((z_abs - 0.7) ** 2)
-            scores.append(score)
+            diff = x - real_mean
+            mahal = np.sqrt(diff @ cov_inv @ diff)
+            scores.append(-mahal)  # Negative because we want to maximize
         
         scores = np.array(scores)
-        keep_idx = np.argsort(scores)[-n_keep:]
+        keep_idx = np.argsort(scores)[-n_keep:]  # Keep highest scores (lowest distance)
         return X_syn[keep_idx]
 
     def sample(self, n_per_class=None):
@@ -427,7 +438,13 @@ class MATDiffPipeline:
         return np.vstack(all_X), np.concatenate(all_y)
 
     def _generate_interpolation_ani(self, X_real, n_needed, class_label):
-        """Generate samples using interpolation + Adaptive Noise Injection."""
+        """Generate samples using diffusion-guided interpolation + ANI.
+        
+        Hybrid approach:
+        1. SMOTE-style interpolation for base samples
+        2. Light diffusion refinement (few steps) for geometry awareness
+        3. Covariance-aligned noise for diversity
+        """
         n_real = len(X_real)
         k = min(5, n_real - 1)
         if k < 1:
@@ -445,19 +462,56 @@ class MATDiffPipeline:
             neighbor_idx = indices[idx, np.random.randint(1, k + 1)]
             x2 = X_real[neighbor_idx]
             
-            # Interpolate with beta distribution (concentrates around 0.5)
+            # Interpolate with beta distribution
             alpha = np.random.beta(2, 2)
             x_new = x1 + alpha * (x2 - x1)
-            
             synthetic.append(x_new)
         
         synthetic = np.array(synthetic)
+        
+        # Apply light diffusion refinement (use trained model!)
+        if self.use_geodesic and self.denoiser is not None:
+            synthetic = self._diffusion_refine(synthetic, class_label)
         
         # Apply Adaptive Noise Injection
         synthetic = self._adaptive_noise_injection(synthetic, class_label)
         synthetic = np.clip(synthetic, 0.0, 1.0)
         
         return synthetic
+
+    def _diffusion_refine(self, X_interp, class_label, n_steps=50):
+        """Light diffusion refinement using trained denoiser.
+        
+        Add small noise, then denoise - this pushes samples toward
+        the learned minority manifold.
+        """
+        try:
+            self.denoiser.eval()
+            X_t = torch.tensor(X_interp, dtype=torch.float32, device=self.device)
+            y_t = torch.full((len(X_t),), class_label, dtype=torch.long, device=self.device)
+            
+            # Add noise at low timestep (t=50, not full 1000)
+            t_start = min(n_steps, self.total_timesteps - 1)
+            t = torch.full((len(X_t),), t_start, dtype=torch.long, device=self.device)
+            
+            noise = torch.randn_like(X_t) * 0.3  # Reduced noise
+            X_noisy = self._q_sample(X_t, t, noise)
+            
+            # Denoise back (single step approximation)
+            with torch.no_grad():
+                noise_pred = self.denoiser(X_noisy, t, y=y_t)
+                
+                # Simple denoising: remove predicted noise
+                alpha_t = self.sqrt_alphas_cumprod[t_start]
+                sigma_t = self.sqrt_one_minus_alphas_cumprod[t_start]
+                
+                X_refined = (X_noisy - sigma_t * noise_pred) / alpha_t
+                X_refined = torch.clamp(X_refined, 0.0, 1.0)
+            
+            return X_refined.cpu().numpy()
+        except Exception:
+            # Fallback: return original
+            return X_interp
 
     def save(self, path: str):
         torch.save({
@@ -499,5 +553,6 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
