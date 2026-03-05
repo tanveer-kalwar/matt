@@ -369,7 +369,7 @@ class MATDiffPipeline:
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
         print(f"    [DMF] use_dmf={self.use_dmf}, X_syn shape={X_syn.shape}, n_keep={n_keep}")
-        """COMPONENT 3: Distribution Matching Filter (DMF) – optimized."""
+        """COMPONENT 3: Distribution Matching Filter (DMF) – fast score-based selection."""
         if len(X_syn) <= n_keep:
             return X_syn
         
@@ -390,7 +390,6 @@ class MATDiffPipeline:
             cov_inv = np.diag(1.0 / (np.diag(real_cov) + 0.01))
         
         diff = X_syn - real_mean
-        # Vectorized: (diff @ cov_inv) * diff, sum over axis=1
         mahal = np.sqrt(np.sum((diff @ cov_inv) * diff, axis=1))
         
         # Compute percentiles from real data
@@ -398,40 +397,16 @@ class MATDiffPipeline:
         real_mahal = np.sqrt(np.sum((diff_real @ cov_inv) * diff_real, axis=1))
         p25, p75 = np.percentile(real_mahal, [25, 75])
         
-        # Score candidates
+        # Score: 1 for samples within [p25, p75*1.5], 0.3 for too close, 0 otherwise
         scores = np.zeros(len(X_syn))
         in_range = (mahal >= p25) & (mahal <= p75 * 1.5)
         scores[in_range] = 1.0
         too_close = mahal < p25 * 0.5
         scores[too_close] = 0.3
         
-        # Select top candidates by score
-        n_candidates = min(n_keep * 3, len(X_syn))
-        candidate_idx = np.argsort(scores)[-n_candidates:]
-        
-        if len(candidate_idx) <= n_keep:
-            return X_syn[candidate_idx]
-        
-        # Greedy diversity selection on candidates (fast with precomputed distances)
-        X_cand = X_syn[candidate_idx]
-        from scipy.spatial.distance import pdist, squareform
-        dist_mat = squareform(pdist(X_cand))  # shape (n_candidates, n_candidates)
-        
-        selected = [0]  # start with highest-scoring candidate
-        candidates_left = set(range(1, n_candidates))
-        
-        while len(selected) < n_keep and candidates_left:
-            best_candidate = None
-            best_min_dist = -1
-            for cand in candidates_left:
-                min_dist = dist_mat[cand, selected].min()
-                if min_dist > best_min_dist:
-                    best_min_dist = min_dist
-                    best_candidate = cand
-            selected.append(best_candidate)
-            candidates_left.remove(best_candidate)
-        
-        return X_syn[candidate_idx[selected]]
+        # Select top n_keep by score (fast)
+        idx = np.argsort(scores)[-n_keep:]
+        return X_syn[idx]
 
     def sample(self, n_per_class=None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
@@ -652,6 +627,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
