@@ -54,7 +54,7 @@ class MATDiffPipeline:
         
         # Component flags - SEPARATE so ablations are clean
         self.use_fisher_weights = True   # BALW component
-        self.use_geodesic = True         # ANI component (noise injection)
+        self.use_geodesic = False         # ANI component (noise injection)
         self.use_spectral = False         # Curriculum scheduler
         self.use_dmf = True              # Distribution Matching Filter (SEPARATE!)
 
@@ -661,6 +661,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
