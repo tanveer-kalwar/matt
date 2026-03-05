@@ -526,7 +526,7 @@ class MATDiffPipeline:
         return np.array(synthetic)
 
     def _light_refinement(self, X_base, class_label, n_steps=10):
-        """Multi-step diffusion refinement with better blend ratio."""
+        """Multi-step diffusion refinement with CONSERVATIVE blend."""
         if int(class_label) not in self.denoisers:
             return X_base
             
@@ -534,24 +534,33 @@ class MATDiffPipeline:
             denoiser = self.denoisers[int(class_label)]
             denoiser.eval()
             
-            X_t = torch.tensor(X_base, dtype=torch.float32, device=self.device)
+            # Check if denoiser is trained (quick test)
+            X_test = torch.tensor(X_base[:5], dtype=torch.float32, device=self.device)
+            t_test = torch.full((5,), 50, dtype=torch.long, device=self.device)
+            with torch.no_grad():
+                noise_pred = denoiser(X_test, t_test, y=None)
+                pred_mean = noise_pred.abs().mean().item()
             
-            # Start from moderate noise (not too high, not too low)
-            t_start = min(50, self.total_timesteps // 4)  # t=50 for T=200
+            # If denoiser is untrained (high output), trust it less
+            if pred_mean > 1.0:
+                print(f"    ⚠️ Denoiser untrained (pred_mean={pred_mean:.2f}), using 30/70 blend")
+                blend_ratio = 0.3  # Trust SMOTE more
+            else:
+                blend_ratio = 0.5  # Balanced
+            
+            X_t = torch.tensor(X_base, dtype=torch.float32, device=self.device)
+            t_start = min(50, self.total_timesteps // 4)
             X_current = X_t.clone()
             
-            # Add initial noise
             noise = torch.randn_like(X_current) * 0.2
             t = torch.full((len(X_current),), t_start, dtype=torch.long, device=self.device)
             X_current = self._q_sample(X_current, t, noise)
             
-            # Multi-step denoising (10 steps instead of 1)
             with torch.no_grad():
                 for t_idx in reversed(range(0, t_start, max(1, t_start // n_steps))):
                     t_batch = torch.full((len(X_current),), t_idx, dtype=torch.long, device=self.device)
                     noise_pred = denoiser(X_current, t_batch, y=None)
                     
-                    # DDPM update
                     alpha = self.alphas[t_idx]
                     alpha_bar = self.alphas_cumprod[t_idx]
                     beta = self.betas[t_idx]
@@ -561,16 +570,16 @@ class MATDiffPipeline:
                     mean = coef1 * (X_current - coef2 * noise_pred)
                     
                     if t_idx > 0:
-                        noise = torch.randn_like(X_current) * 0.1  # Small noise
-                        sigma = torch.sqrt(beta * 0.5)  # Reduced variance
+                        noise = torch.randn_like(X_current) * 0.1
+                        sigma = torch.sqrt(beta * 0.5)
                         X_current = mean + sigma * noise
                     else:
                         X_current = mean
             
             X_denoised = torch.clamp(X_current, 0.0, 1.0)
             
-            # BETTER blend: 85% denoised, 15% original (trust diffusion more)
-            X_blended = 0.85 * X_denoised.cpu().numpy() + 0.15 * X_base
+            # ADAPTIVE blend based on denoiser quality
+            X_blended = blend_ratio * X_denoised.cpu().numpy() + (1 - blend_ratio) * X_base
             
             return np.clip(X_blended, 0.0, 1.0)
             
@@ -661,6 +670,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
