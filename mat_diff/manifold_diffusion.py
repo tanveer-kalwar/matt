@@ -143,6 +143,7 @@ class MATDiffPipeline:
     def fit(self, X_train, y_train, epochs=300, batch_size=128, verbose=True, val_split=0.1):
         """Train separate denoiser for each minority class."""
         self.X_train = X_train.copy()
+        print(f"  [MATDiff] fit: use_spectral={self.use_spectral}, use_fisher_weights={self.use_fisher_weights}")
         self.y_train = y_train.copy()
         self.n_features = X_train.shape[1]
         classes = np.unique(y_train)
@@ -367,6 +368,7 @@ class MATDiffPipeline:
         return x_interpolated + noise
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
+        print(f"    [DMF] use_dmf={self.use_dmf}, X_syn shape={X_syn.shape}, n_keep={n_keep}")
         """COMPONENT 3: Distribution Matching Filter (DMF).
         
         WITHOUT DMF (use_dmf=False): Random selection
@@ -455,6 +457,7 @@ class MATDiffPipeline:
     def sample(self, n_per_class=None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
         if not self.denoisers:
+            print(f"  [MATDiff] sample: use_geodesic={self.use_geodesic}, use_dmf={self.use_dmf}")
             raise RuntimeError("Call fit() before sample().")
 
         if n_per_class is None:
@@ -670,6 +673,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
