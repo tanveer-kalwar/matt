@@ -982,7 +982,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             use_fisher_weights = True
             use_geodesic = False
             use_spectral = False
-            use_dmf = True
+            use_dmf = False
             
             if variant_name == "w/o Fisher":
                 use_fisher_weights = False
@@ -1268,6 +1268,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
