@@ -981,8 +981,8 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             # Configure variant flags BEFORE creating pipeline
             use_fisher_weights = True
             use_geodesic = False
-            use_spectral = False
-            use_dmf = False
+            use_spectral = True
+            use_dmf = True
             
             if variant_name == "w/o Fisher":
                 use_fisher_weights = False
@@ -1268,6 +1268,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
