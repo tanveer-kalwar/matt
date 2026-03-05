@@ -18,7 +18,7 @@ Hyperparameter derivation rules:
               Approximately 8 batches per epoch for stable gradient estimates
     epochs:   Scaled by IR: base=500, +80*log2(IR), capped at 1500
               Higher imbalance requires longer training
-    lr:       4e-4
+    lr:       1e-3
 
 """
 
@@ -179,9 +179,9 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     # More epochs needed because training on minority data only (much smaller)
     # More epochs needed because training on minority data only (much smaller)
     # BUT: Cap more aggressively to prevent overfitting
-    base_epochs = 300  # REDUCED from 500
-    ir_bonus = int(60 * math.log2(max(ir, 1)))  # REDUCED from 80
-    epochs = min(800, base_epochs + ir_bonus)  # REDUCED cap from 1500
+    base_epochs = 500  # REDUCED from 500
+    ir_bonus = int(80 * math.log2(max(ir, 1)))
+    epochs = min(1200, base_epochs + ir_bonus) 
     if n_samples < 500:
         epochs = min(epochs, 800)
 
@@ -218,8 +218,8 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         n_phases = 1
 
     # Regularisation: increase for small/sample-starved datasets
-    dropout = 0.15 if spf < 20 else 0.1
-    weight_decay = 1e-4 if spf < 20 else 1e-5
+    dropout = 0.0
+    weight_decay = 0.0
 
     sampling_steps = 200
 
@@ -230,7 +230,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         "n_heads": n_heads,
         "batch_size": batch_size,
         "epochs": epochs,
-        "lr": 4e-4,
+        "lr": 1e-3,
         "dropout": dropout,
         "total_timesteps": 200,
         "sampling_steps": sampling_steps,
@@ -256,6 +256,7 @@ def get_matdiff_config(dataset_name: str) -> Dict[str, Any]:
     cfg["ir"] = info["ir"]
     cfg["n_classes"] = info.get("n_classes", 2)
     return cfg
+
 
 
 
