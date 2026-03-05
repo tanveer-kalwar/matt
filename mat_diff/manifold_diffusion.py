@@ -439,7 +439,7 @@ class MATDiffPipeline:
             print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
 
             # Generate 2x needed for DMF selection
-            n_generate = min(int(n_needed * 1.2), 10000)
+            n_generate = min(n_needed * 2, 1000)
             
             # HYBRID: SMOTE base + light diffusion refinement
             X_base = self._smote_base(X_real_c, n_generate)
@@ -627,6 +627,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
