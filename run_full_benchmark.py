@@ -641,6 +641,11 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         X_tr_80, _, y_tr_80, _ = train_test_split(
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
+
+        # Compute minority count for adaptive MAT-Diff configuration
+        from collections import Counter
+        cc_80 = Counter(y_tr_80)
+        minority_count_80 = min(cc_80.values())
         
         print(f"\n  [TRAINING PHASE - All methods train once on {len(X_tr_80)} samples]")
         
@@ -690,6 +695,11 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     dropout=cfg.get("dropout", 0.1), lr=cfg["lr"],
                     weight_decay=cfg.get("weight_decay", 1e-5),
                 )
+                # Set adaptive flags
+                matdiff_pipeline.use_fisher_weights = True
+                matdiff_pipeline.use_geodesic = False
+                matdiff_pipeline.use_spectral = minority_count_80 >= 300
+                matdiff_pipeline.use_dmf = minority_count_80 >= 300
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
                            batch_size=cfg["batch_size"], verbose=False)
                 # Generate large pool of samples
@@ -967,6 +977,11 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
 
+        # Compute minority count for adaptive configuration
+        from collections import Counter
+        cc_80 = Counter(y_tr_80)
+        minority_count_80 = min(cc_80.values())
+
         print(f"\n  [TRAINING PHASE - Train each variant once on {len(X_tr_80)} samples]")
 
         # Train all variants ONCE and store their synthetic samples
@@ -978,27 +993,48 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
 
-            # Configure variant flags BEFORE creating pipeline
-            use_fisher_weights = True
-            use_geodesic = False
-            use_spectral = True
-            use_dmf = True
-            
-            if variant_name == "w/o Fisher":
-                use_fisher_weights = False
-            elif variant_name == "w/o Geodesic":
+            # Fixed baseline for ablations (full model with geodesic off)
+            baseline_fisher = True
+            baseline_geodesic = False   # geodesic/ANI is kept off in baseline
+            baseline_spectral = True
+            baseline_dmf = True
+
+            if variant_name == "MAT-Diff (Ours)":
+                # Adaptive: enable spectral and DMF only if minority count >= 300
+                use_fisher_weights = True
                 use_geodesic = False
+                use_spectral = minority_count_80 >= 300
+                use_dmf = minority_count_80 >= 300
+            elif variant_name == "w/o Fisher":
+                use_fisher_weights = False
+                use_geodesic = baseline_geodesic
+                use_spectral = baseline_spectral
+                use_dmf = baseline_dmf
+            elif variant_name == "w/o Geodesic":
+                use_fisher_weights = baseline_fisher
+                use_geodesic = True   # turn on geodesic (opposite of baseline)
+                use_spectral = baseline_spectral
+                use_dmf = baseline_dmf
             elif variant_name == "w/o Spectral":
+                use_fisher_weights = baseline_fisher
+                use_geodesic = baseline_geodesic
                 use_spectral = False
+                use_dmf = baseline_dmf
             elif variant_name == "w/o DMF":
+                use_fisher_weights = baseline_fisher
+                use_geodesic = baseline_geodesic
+                use_spectral = baseline_spectral
                 use_dmf = False
+            else:
+                # Should not happen
+                use_fisher_weights = baseline_fisher
+                use_geodesic = baseline_geodesic
+                use_spectral = baseline_spectral
+                use_dmf = baseline_dmf
 
             try:
-                # Seed TRAINING per variant
-                _train_seed = {'w/o Fisher': 101, 'w/o Geodesic': 202,
-                               'w/o Spectral': 303, 'w/o DMF': 505, 'MAT-Diff (Ours)': 404}.get(variant_name, 42)
-                torch.manual_seed(_train_seed)
-                np.random.seed(_train_seed)
+                torch.manual_seed(42)
+                np.random.seed(42)
 
                 # Create pipeline ONCE with correct flags
                 pipeline = MATDiffPipeline(
@@ -1024,9 +1060,8 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
                              batch_size=cfg["batch_size"], verbose=False)
 
-                # Sample with different seed
-                torch.manual_seed({'w/o Fisher': 1001, 'w/o Geodesic': 1002,
-                                   'w/o Spectral': 1003, 'w/o DMF': 1005, 'MAT-Diff (Ours)': 1004}.get(variant_name, 1000))
+                # Fixed seed for sampling (same for all variants)
+                torch.manual_seed(1000)   # or any fixed number
                 X_syn_raw, y_syn_raw = pipeline.sample()
                 trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
                 print("✓")
@@ -1268,6 +1303,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
