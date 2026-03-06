@@ -1000,8 +1000,8 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             if variant_name == "MAT-Diff (Ours)":
                 # Adaptive: enable spectral and DMF only if minority count >= 300
                 use_fisher_weights = True
-                use_spectral = minority_count_80 >= 300
-                use_dmf = minority_count_80 >= 300
+                use_spectral = True
+                use_dmf = True
             elif variant_name == "w/o Fisher":
                 use_fisher_weights = False
                 use_spectral = baseline_spectral
@@ -1296,6 +1296,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
