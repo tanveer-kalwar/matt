@@ -944,7 +944,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     ABLATION_VARIANTS = {
         "IDENTITY":         "No oversampling baseline",
         "w/o Fisher":       "Disable Fisher loss weighting (uniform weights)",
-        "w/o Geodesic":     "Replace Geodesic Attention with standard attention",
         "w/o Spectral":     "Replace Spectral Curriculum with uniform linear schedule",
         "w/o DMF":          "Disable Distribution Matching Filter (random selection)",
         "MAT-Diff (Ours)":  "Full model with all components",
@@ -993,7 +992,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
 
-            # Fixed baseline for ablations (full model with geodesic off)
+            # Fixed baseline for ablations
             baseline_fisher = True
             baseline_geodesic = False   # geodesic/ANI is kept off in baseline
             baseline_spectral = True
@@ -1010,11 +1009,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 use_geodesic = baseline_geodesic
                 use_spectral = baseline_spectral
                 use_dmf = baseline_dmf
-            elif variant_name == "w/o Geodesic":
-                use_fisher_weights = baseline_fisher
-                use_geodesic = True   # turn on geodesic (opposite of baseline)
-                use_spectral = baseline_spectral
-                use_dmf = baseline_dmf
             elif variant_name == "w/o Spectral":
                 use_fisher_weights = baseline_fisher
                 use_geodesic = baseline_geodesic
@@ -1026,7 +1020,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 use_spectral = baseline_spectral
                 use_dmf = False
             else:
-                # Should not happen
+                # Should not happen (for completeness)
                 use_fisher_weights = baseline_fisher
                 use_geodesic = baseline_geodesic
                 use_spectral = baseline_spectral
@@ -1303,6 +1297,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
