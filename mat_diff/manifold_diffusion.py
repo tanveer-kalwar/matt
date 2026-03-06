@@ -54,7 +54,6 @@ class MATDiffPipeline:
         
         # Component flags - SEPARATE so ablations are clean
         self.use_fisher_weights = True   # BALW component
-        self.use_geodesic = False         # ANI component (noise injection)
         self.use_spectral = True         # Curriculum scheduler
         self.use_dmf = True              # Distribution Matching Filter (SEPARATE!)
 
@@ -222,7 +221,7 @@ class MATDiffPipeline:
                 n_heads=self.n_heads,
                 dropout=self.dropout,
                 use_curvature=False,
-                use_geodesic=self.use_geodesic,
+                use_geodesic=False,
             ).to(self.device)
 
             optimizer = torch.optim.AdamW(
@@ -339,33 +338,8 @@ class MATDiffPipeline:
             return mean
 
     def _adaptive_noise_injection(self, x_interpolated, class_label):
-        """COMPONENT 2: Adaptive Noise Injection (ANI).
-        
-        WITHOUT ANI (use_geodesic=False): No noise added (pure SMOTE)
-        WITH ANI (use_geodesic=True): SMALL covariance-aligned noise for diversity
-        """
-        if not self.use_geodesic:
-            # Without ANI: NO noise (pure interpolation like SMOTE)
-            return x_interpolated
-        
-        # WITH ANI: Add SMALL covariance-aligned noise (reduced from 0.15 to 0.05)
-        if class_label in self._minority_covs:
-            cov = self._minority_covs[class_label]
-            try:
-                # Eigendecomposition for principal directions
-                eigvals, eigvecs = np.linalg.eigh(cov)
-                eigvals = np.maximum(eigvals, 1e-8)
-                # REDUCED: Scale noise along principal directions (0.05 scale factor)
-                noise_scale = np.sqrt(eigvals) * 0.05  # WAS 0.15, NOW 0.05
-                noise_raw = np.random.randn(len(x_interpolated), len(eigvals))
-                noise = (noise_raw * noise_scale) @ eigvecs.T
-            except:
-                # Fallback: isotropic noise scaled by feature std (reduced)
-                noise = np.random.randn(*x_interpolated.shape) * 0.03  # WAS 0.08, NOW 0.03
-        else:
-            noise = np.random.randn(*x_interpolated.shape) * 0.03  # WAS 0.08, NOW 0.03
-        
-        return x_interpolated + noise
+        # ANI permanently disabled – return input unchanged
+        return x_interpolated
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
         print(f"    [DMF] use_dmf={self.use_dmf}, X_syn shape={X_syn.shape}, n_keep={n_keep}")
@@ -411,7 +385,7 @@ class MATDiffPipeline:
     def sample(self, n_per_class=None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
         if not self.denoisers:
-            print(f"  [MATDiff] sample: use_geodesic={self.use_geodesic}, use_dmf={self.use_dmf}")
+            print(f"  [MATDiff] sample: use_dmf={self.use_dmf}")
             raise RuntimeError("Call fit() before sample().")
 
         if n_per_class is None:
@@ -612,7 +586,7 @@ class MATDiffPipeline:
                 d_in=self.n_features, num_classes=0,  # Unconditional
                 d_model=self.d_model, d_hidden=self.d_hidden,
                 n_blocks=self.n_blocks, n_heads=self.n_heads,
-                use_curvature=False, use_geodesic=True,
+                use_curvature=False, use_geodesic=False,
             ).to(self.device)
             denoiser_c.load_state_dict(state)
             self.denoisers[int(class_label)] = denoiser_c
@@ -627,6 +601,7 @@ class MATDiffPipeline:
         if self.scheduler:
             beta_schedule = self.scheduler.get_full_beta_schedule()
             self._setup_diffusion(beta_schedule)
+
 
 
 
