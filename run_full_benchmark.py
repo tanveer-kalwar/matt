@@ -697,7 +697,6 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 )
                 # Set adaptive flags
                 matdiff_pipeline.use_fisher_weights = True
-                matdiff_pipeline.use_geodesic = False
                 matdiff_pipeline.use_spectral = minority_count_80 >= 300
                 matdiff_pipeline.use_dmf = minority_count_80 >= 300
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
@@ -813,10 +812,11 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     y_aug = np.hstack([y_tr, y_syn])
                 
                 if X_aug is None:
-                    X_aug, y_aug = X_tr, y_tr
-                
-                # Evaluate
-                clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                    print(f"      Warning: {method} failed for seed {seed}, using NaNs")
+                    # Create dummy results with NaNs
+                    clf_res = {cn: {m: np.nan for m in UTIL_METRICS} for cn in CLF_NAMES}
+                else:
+                    clf_res = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
                 for cn in CLF_NAMES:
                     for m in UTIL_METRICS:
                         all_method_results[method]['utility'][cn][m].append(
@@ -992,37 +992,31 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
 
-            # Fixed baseline for ablations
+            # Fixed baseline for ablations (full model)
             baseline_fisher = True
-            baseline_geodesic = False   # geodesic/ANI is kept off in baseline
             baseline_spectral = True
             baseline_dmf = True
 
             if variant_name == "MAT-Diff (Ours)":
                 # Adaptive: enable spectral and DMF only if minority count >= 300
                 use_fisher_weights = True
-                use_geodesic = False
                 use_spectral = minority_count_80 >= 300
                 use_dmf = minority_count_80 >= 300
             elif variant_name == "w/o Fisher":
                 use_fisher_weights = False
-                use_geodesic = baseline_geodesic
                 use_spectral = baseline_spectral
                 use_dmf = baseline_dmf
             elif variant_name == "w/o Spectral":
                 use_fisher_weights = baseline_fisher
-                use_geodesic = baseline_geodesic
                 use_spectral = False
                 use_dmf = baseline_dmf
             elif variant_name == "w/o DMF":
                 use_fisher_weights = baseline_fisher
-                use_geodesic = baseline_geodesic
                 use_spectral = baseline_spectral
                 use_dmf = False
             else:
-                # Should not happen (for completeness)
+                # Should not happen
                 use_fisher_weights = baseline_fisher
-                use_geodesic = baseline_geodesic
                 use_spectral = baseline_spectral
                 use_dmf = baseline_dmf
 
@@ -1047,7 +1041,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 
                 # Set flags AFTER creation
                 pipeline.use_fisher_weights = use_fisher_weights
-                pipeline.use_geodesic = use_geodesic
                 pipeline.use_spectral = use_spectral
                 pipeline.use_dmf = use_dmf
 
@@ -1100,12 +1093,18 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                         X_aug = np.vstack([X_tr, X_syn])
                         y_aug = np.hstack([y_tr, y_syn_part])
                     else:
-                        X_aug, y_aug = X_tr, y_tr
+                        print(f"      Warning: {variant_name} generated no samples for class {minority_label}, using NaNs")
+                        X_aug, y_aug = None, None
                 else:
-                    X_aug, y_aug = X_tr, y_tr
+                    print(f"      Warning: {variant_name} not trained, using NaNs")
+                    X_aug, y_aug = None, None
 
-                X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=1.0, neginf=0.0)
-                clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
+                if X_aug is None:
+                    # Create dummy results with NaNs
+                    clf_results = {cn: {m: np.nan for m in UTIL_METRICS} for cn in CLF_NAMES}
+                else:
+                    X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=1.0, neginf=0.0)
+                    clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
 
                 f1_avg  = np.mean([clf_results[cn]["F1"]  for cn in CLF_NAMES])
                 acc_avg = np.mean([clf_results[cn]["Acc"] for cn in CLF_NAMES])
@@ -1208,7 +1207,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
         # Build pivot with formatted "mean ± std" strings
         pivot_data = {}
-        order = ["IDENTITY", "w/o Fisher", "w/o Geodesic", "w/o Spectral", "w/o DMF", "MAT-Diff (Ours)"]
+        order = ["IDENTITY", "w/o Fisher", "w/o Spectral", "w/o DMF", "MAT-Diff (Ours)"]
 
         for ds_name in df["Dataset"].unique():
             pivot_data[ds_name] = {}
@@ -1297,6 +1296,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
