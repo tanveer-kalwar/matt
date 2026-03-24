@@ -135,7 +135,7 @@ class MATDiffPipeline:
         weights = weights / (weights.mean() + 1e-8)
         
         # Clip to prevent extreme weights
-        weights = np.clip(weights, 0.3, 3.0)
+        weights = np.clip(weights, 0.5, 2.0)
         
         return weights
 
@@ -480,7 +480,7 @@ class MATDiffPipeline:
                 blend_ratio = 0.5  # Balanced
             
             X_t = torch.tensor(X_base, dtype=torch.float32, device=self.device)
-            t_start = min(50, self.total_timesteps // 4)
+            t_start = min(150, self.total_timesteps // 6)
             X_current = X_t.clone()
             
             noise = torch.randn_like(X_current) * 0.2
