@@ -13,7 +13,7 @@ import pandas as pd
 from collections import Counter
 from pathlib import Path
 import tempfile
-
+import time
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import LogisticRegression
@@ -642,6 +642,8 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
 
+        training_times = {}
+
         # Compute minority count for adaptive MAT-Diff configuration
         from collections import Counter
         cc_80 = Counter(y_tr_80)
@@ -653,39 +655,50 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
         dgot_samples = None
         goio_samples = None
         if "DGOT" in ALL_METHODS:
+            t_start = time.time()
             if setup_and_train_dgot(ds_name, X_tr_80, y_tr_80, device):
                 dgot_samples = load_dgot_samples(ds_name)
+            t_dgot = time.time() - t_start
+            training_times["DGOT"] = t_dgot
         if "GOIO" in ALL_METHODS:
+            t_start = time.time()
             if setup_and_train_goio(ds_name, X_tr_80, y_tr_80, device):
                 goio_samples = load_goio_samples(ds_name)
+            t_goio = time.time() - t_start
+            training_times["GOIO"] = t_goio   
         
         # Train CTGAN once
         ctgan_samples = None
         if "CTGAN" in ALL_METHODS:
             print(f"    [CTGAN] Training...")
+            t_start = time.time()
             out = apply_generative_resample(X_tr_80, y_tr_80, "CTGAN", seed=42)
             if out:
                 _, _, ctgan_samples = out
                 print(f"    [CTGAN] Training complete ✓")
             else:
                 print(f"    [CTGAN] Training FAILED ✗")
+            training_times["CTGAN"] = time.time() - t_start
         
         # Train TabDDPM once
         tabddpm_samples = None
         if "TabDDPM" in ALL_METHODS:
             print(f"    [TabDDPM] Training...")
+            t_start = time.time()
             out = apply_tabddpm_resample(X_tr_80, y_tr_80, seed=42, device=device)
             if out:
                 _, _, tabddpm_samples = out
                 print(f"    [TabDDPM] Training complete ✓")
             else:
                 print(f"    [TabDDPM] Training FAILED ✗")
+            training_times["TabDDPM"] = time.time() - t_start
         
         # Train MAT-Diff ONCE
         matdiff_samples = None
         if "MAT-Diff" in ALL_METHODS:
             print(f"    [MAT-Diff] Training...")
             try:
+                t_start = time.time()
                 matdiff_pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"], d_hidden=cfg["d_hidden"],
@@ -704,6 +717,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 # Generate large pool of samples
                 X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
                 matdiff_samples = (X_syn_raw, y_syn_raw)
+                training_times["MAT-Diff"] = time.time() - t_start
                 print(f"    [MAT-Diff] Training complete ✓")
             except Exception as e:
                 print(f"    [MAT-Diff] Training FAILED: {str(e)[:100]}")
@@ -887,6 +901,18 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
             if f1_vals:
                 print(f"    {method:<20s} F1: {np.mean(f1_vals):.4f} ± {np.std(f1_vals):.4f}")
 
+        # Store training times  
+        for method, t in training_times.items():
+            all_rows.append({
+                "Dataset": ds_name,
+                "Method": method,
+                "Classifier": "TIME",
+                "Metric": "TrainingTime",
+                "Mean": t,
+                "Std": 0.0,
+                "N": 1,
+            })
+
     # Save results
     df = pd.DataFrame(all_rows)
     out_path = os.path.abspath("benchmark_results.csv")
@@ -905,7 +931,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
             mdf = df[df["Method"] == method]
             row = {"Method": method}
             
-            for metric in ["F1", "Acc", "MCC", "BalAcc", "AUC_PR", "MMD", "KS", "DCR", "MIA"]:
+            for metric in ["F1", "Acc", "MCC", "BalAcc", "AUC_PR", "MMD", "KS", "DCR", "MIA", "TrainingTime"]:
                 metric_vals = mdf[mdf["Metric"] == metric]["Mean"].values
                 if len(metric_vals) > 0:
                     row[metric] = f"{np.mean(metric_vals):.4f} ± {np.std(metric_vals):.4f}"
