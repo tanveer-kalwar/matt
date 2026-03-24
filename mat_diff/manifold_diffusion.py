@@ -342,46 +342,31 @@ class MATDiffPipeline:
         return x_interpolated
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
-        print(f"    [DMF] use_dmf={self.use_dmf}, X_syn shape={X_syn.shape}, n_keep={n_keep}")
-        """COMPONENT 3: Distribution Matching Filter (DMF) – fast score-based selection."""
-        if len(X_syn) <= n_keep:
-            return X_syn
+        """Manifold Support DMF: Preserves diversity by ensuring synthetic samples 
+        fall within the local density of the real manifold."""
+        if len(X_syn) <= n_keep or not self.use_dmf:
+            return X_syn[:n_keep]
         
-        if not self.use_dmf:
-            idx = np.random.choice(len(X_syn), n_keep, replace=False)
-            return X_syn[idx]
+        # 1. Fit NN on real data to capture local manifold structure
+        k = min(5, len(X_real) - 1)
+        nn_real = NearestNeighbors(n_neighbors=k).fit(X_real)
         
-        # Vectorized Mahalanobis distance
-        real_mean = X_real.mean(axis=0)
-        real_cov = np.cov(X_real, rowvar=False)
-        if real_cov.ndim == 0:
-            real_cov = np.array([[real_cov]])
-        real_cov += np.eye(real_cov.shape[0]) * 0.01  # regularization
+        # 2. Measure distance from synthetic samples to the real manifold
+        distances, _ = nn_real.kneighbors(X_syn)
+        avg_dist_to_manifold = distances.mean(axis=1)
         
-        try:
-            cov_inv = np.linalg.pinv(real_cov)
-        except:
-            cov_inv = np.diag(1.0 / (np.diag(real_cov) + 0.01))
+        # 3. Measure internal density of real data for dynamic threshold
+        real_distances, _ = nn_real.kneighbors(X_real)
+        threshold = np.percentile(real_distances.mean(axis=1), 95)
         
-        diff = X_syn - real_mean
-        mahal = np.sqrt(np.sum((diff @ cov_inv) * diff, axis=1))
+        # 4. Soft Scoring: 1.0 for manifold-supported samples, 0.1 for outliers
+        scores = np.where(avg_dist_to_manifold <= threshold, 1.0, 0.1)
         
-        # Compute percentiles from real data
-        diff_real = X_real - real_mean
-        real_mahal = np.sqrt(np.sum((diff_real @ cov_inv) * diff_real, axis=1))
-        p25, p75 = np.percentile(real_mahal, [25, 75])
-        
-        # Score: 1 for samples within [p25, p75*1.5], 0.3 for too close, 0 otherwise
-        scores = np.zeros(len(X_syn))
-        in_range = (mahal >= p25) & (mahal <= p75 * 1.5)
-        scores[in_range] = 1.0
-        too_close = mahal < p25 * 0.5
-        scores[too_close] = 0.3
-        
-        # Select top n_keep by score (fast)
-        idx = np.argsort(scores)[-n_keep:]
+        # 5. Weighted sampling (Diversity-Preserving)
+        probs = scores / scores.sum()
+        idx = np.random.choice(len(X_syn), n_keep, replace=False, p=probs)
         return X_syn[idx]
-
+        
     def sample(self, n_per_class=None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
         if not self.denoisers:
