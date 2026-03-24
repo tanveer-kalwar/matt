@@ -697,8 +697,8 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 )
                 # Set adaptive flags
                 matdiff_pipeline.use_fisher_weights = True
-                matdiff_pipeline.use_spectral = minority_count_80 >= 300
-                matdiff_pipeline.use_dmf = minority_count_80 >= 300
+                matdiff_pipeline.use_spectral = True
+                matdiff_pipeline.use_dmf = True
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
                            batch_size=cfg["batch_size"], verbose=False)
                 # Generate large pool of samples
