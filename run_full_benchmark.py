@@ -698,7 +698,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 # Set adaptive flags
                 matdiff_pipeline.use_fisher_weights = True
                 matdiff_pipeline.use_spectral = minority_count_80 >= 300
-                matdiff_pipeline.use_dmf = minority_count_80 >= 300
+                matdiff_pipeline.use_dmf = False
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
                            batch_size=cfg["batch_size"], verbose=False)
                 # Generate large pool of samples
@@ -995,7 +995,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             # Fixed baseline for ablations (full model)
             baseline_fisher = True
             baseline_spectral = True
-            baseline_dmf = True
+            baseline_dmf = False
 
             if variant_name == "MAT-Diff (Ours)":
                 # Adaptive: enable spectral and DMF only if minority count >= 300
