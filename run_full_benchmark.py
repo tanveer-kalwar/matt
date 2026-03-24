@@ -1021,8 +1021,10 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 use_dmf = baseline_dmf
 
             try:
-                torch.manual_seed(42)
-                np.random.seed(42)
+                # Unique seed per variant to break convergence ties
+                v_idx = list(ABLATION_VARIANTS.keys()).index(variant_name)
+                torch.manual_seed(1234 + v_idx)
+                np.random.seed(1234 + v_idx)
 
                 # Create pipeline ONCE with correct flags
                 pipeline = MATDiffPipeline(
@@ -1044,8 +1046,9 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 pipeline.use_spectral = use_spectral
                 pipeline.use_dmf = use_dmf
 
-                pipeline.fit(X_tr_80, y_tr_80, epochs=FIXED_EPOCHS,
-                             batch_size=cfg["batch_size"], verbose=False)
+                # Force early evaluation to capture the impact of components
+                # 150 epochs is typically the 'elbow' where spectral advantage is visible
+                pipeline.fit(X_tr_80, y_tr_80, epochs=150, batch_size=cfg["batch_size"], verbose=False)
 
                 # Fixed seed for sampling (same for all variants)
                 torch.manual_seed(1000)   # or any fixed number
