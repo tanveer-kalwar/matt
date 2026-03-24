@@ -342,28 +342,25 @@ class MATDiffPipeline:
         return x_interpolated
 
     def _distribution_matching_filter(self, X_syn, X_real, n_keep):
-        """Manifold Support DMF: Preserves diversity by ensuring synthetic samples 
-        fall within the local density of the real manifold."""
+        """Manifold Support DMF: Rejects outliers but preserves boundary diversity."""
         if len(X_syn) <= n_keep or not self.use_dmf:
             return X_syn[:n_keep]
         
-        # 1. Fit NN on real data to capture local manifold structure
+        # 1. Capture local manifold density using k-NN
         k = min(5, len(X_real) - 1)
         nn_real = NearestNeighbors(n_neighbors=k).fit(X_real)
         
-        # 2. Measure distance from synthetic samples to the real manifold
-        distances, _ = nn_real.kneighbors(X_syn)
-        avg_dist_to_manifold = distances.mean(axis=1)
+        # 2. Score synthetic samples based on average distance to the real manifold
+        dists, _ = nn_real.kneighbors(X_syn)
+        avg_dist = dists.mean(axis=1)
         
-        # 3. Measure internal density of real data for dynamic threshold
-        real_distances, _ = nn_real.kneighbors(X_real)
-        threshold = np.percentile(real_distances.mean(axis=1), 95)
-        
-        # 4. Soft Scoring: 1.0 for manifold-supported samples, 0.1 for outliers
-        scores = np.where(avg_dist_to_manifold <= threshold, 1.0, 0.1)
-        
-        # 5. Weighted sampling (Diversity-Preserving)
+        # 3. Soft Probabilistic Selection (Crucial for diversity)
+        # Instead of taking the top N, we assign a probability based on density.
+        # This prevents the 'Full' model from collapsing into a single point.
+        scores = np.exp(-avg_dist / (np.median(avg_dist) + 1e-6))
         probs = scores / scores.sum()
+        
+        # 4. Weighted sampling
         idx = np.random.choice(len(X_syn), n_keep, replace=False, p=probs)
         return X_syn[idx]
         
