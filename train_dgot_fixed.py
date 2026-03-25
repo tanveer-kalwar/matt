@@ -39,6 +39,10 @@ def prepare_data_for_dgot(dataset_name, X_train, y_train, repo_dir, fold=0):
     With shape (N, 1, features) for xtrain.npy
     Also needs TEST data
     """
+    # Logic-neutral padding: ensures D >= 16 for convolutional kernel compatibility
+    if X_train.shape[1] < 16:
+        pad_width = 16 - X_train.shape[1]
+        X_train = np.pad(X_train, ((0, 0), (0, pad_width)), mode='constant')
     # Create DGOT directory
     data_dir = f"{repo_dir}/datasets/{dataset_name}/DGOT/exp{fold}"
     os.makedirs(data_dir, exist_ok=True)
@@ -144,6 +148,7 @@ def main():
     # Load
     X_train = np.load(args.X_train)
     y_train = np.load(args.y_train)
+    original_dim = X_train.shape[1]
     print(f"  Data: {X_train.shape}, Classes: {np.unique(y_train)}")
     
     # Prepare
@@ -225,7 +230,13 @@ def main():
                     x_0 = netG(x, t, latent_zc)
                     x = sample_posterior(pos_coeff, x_0, x, t)
                 
-                synthetic = x.cpu().numpy().squeeze()
+                synthetic = x.cpu().numpy()
+                # Ensure 2D (N, features) before slicing
+                if synthetic.ndim == 3: 
+                    synthetic = synthetic.squeeze(1)
+                
+                # Slice back to original dimensions to remove padding
+                synthetic = synthetic[:, :original_dim]
                 
                 # Denormalize
                 X_min = X_train.min(axis=0, keepdims=True)
