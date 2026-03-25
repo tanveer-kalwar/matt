@@ -8,6 +8,7 @@ import sys
 import argparse
 import warnings
 import subprocess
+import random
 import numpy as np
 import pandas as pd
 from collections import Counter
@@ -34,6 +35,21 @@ from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN, KMeansSMOTE
 from imblearn.combine import SMOTETomek
 
 warnings.filterwarnings("ignore")
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -694,7 +710,7 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
             training_times["TabDDPM"] = time.time() - t_start
         
         # Train MAT-Diff ONCE
-        matdiff_samples = None
+        matdiff_pipeline = None
         if "MAT-Diff" in ALL_METHODS:
             print(f"    [MAT-Diff] Training...")
             try:
@@ -714,9 +730,6 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                 matdiff_pipeline.use_dmf = True
                 matdiff_pipeline.fit(X_tr_80, y_tr_80, epochs=matdiff_epochs,
                            batch_size=cfg["batch_size"], verbose=False)
-                # Generate large pool of samples
-                X_syn_raw, y_syn_raw = matdiff_pipeline.sample()
-                matdiff_samples = (X_syn_raw, y_syn_raw)
                 training_times["MAT-Diff"] = time.time() - t_start
                 print(f"    [MAT-Diff] Training complete ✓")
             except Exception as e:
@@ -777,31 +790,35 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
                     y_aug = np.hstack([y_tr, y_syn])
                 
                 # MAT-Diff: use pre-trained samples (same logic as ablation)
-                elif method == "MAT-Diff" and matdiff_samples is not None:
-                    X_syn_raw, y_syn_raw = matdiff_samples
-                    
-                    cc = Counter(y_tr)
-                    majority_count = max(cc.values())
-                    
-                    # Augment ALL minority classes (not just the smallest one)
-                    X_syn_parts, y_syn_parts = [], []
-                    for c_label, c_count in cc.items():
-                        if c_count < majority_count:
-                            deficit = majority_count - c_count
-                            mask = (y_syn_raw == c_label)
-                            X_c = X_syn_raw[mask][:deficit]
-                            if len(X_c) > 0:
-                                X_syn_parts.append(X_c)
-                                y_syn_parts.append(np.full(len(X_c), c_label))
-                    
-                    if X_syn_parts:
-                        X_syn = np.vstack(X_syn_parts)
-                        y_syn = np.concatenate(y_syn_parts)
-                        X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn])
-                    else:
+                elif method == "MAT-Diff" and matdiff_pipeline is not None:
+                    try:
+                        X_syn_raw, y_syn_raw = matdiff_pipeline.sample(seed=seed)
+                    except Exception:
                         X_aug, y_aug = X_tr, y_tr
                         X_syn = None
+                    else:
+                        cc = Counter(y_tr)
+                        majority_count = max(cc.values())
+
+                        # Augment ALL minority classes (not just the smallest one)
+                        X_syn_parts, y_syn_parts = [], []
+                        for c_label, c_count in cc.items():
+                            if c_count < majority_count:
+                                deficit = majority_count - c_count
+                                mask = (y_syn_raw == c_label)
+                                X_c = X_syn_raw[mask][:deficit]
+                                if len(X_c) > 0:
+                                    X_syn_parts.append(X_c)
+                                    y_syn_parts.append(np.full(len(X_c), c_label))
+
+                        if X_syn_parts:
+                            X_syn = np.vstack(X_syn_parts)
+                            y_syn = np.concatenate(y_syn_parts)
+                            X_aug = np.vstack([X_tr, X_syn])
+                            y_aug = np.hstack([y_tr, y_syn])
+                        else:
+                            X_aug, y_aug = X_tr, y_tr
+                            X_syn = None
                 
                 # DGOT: use pre-trained samples
                 elif method == "DGOT" and dgot_samples is not None:
@@ -1282,6 +1299,8 @@ def main():
     
     datasets = args.datasets or list(DATASET_REGISTRY.keys())
     
+    set_global_seed(42)
+
     print("=" * 80)
     print("MAT-Diff Benchmark - FINAL VERSION")
     print(f"Device: {device}, Datasets: {datasets}")
