@@ -158,7 +158,13 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     if n_samples < 500 or spf < 10:
         n_blocks = 2
     elif n_features > 50:
-        n_blocks = 4
+        # For high-dimensional data, 4 blocks only when the minority class has
+        # ≥ 8 samples per feature.  Below this threshold the deeper model is prone
+        # to overfitting on the (small) minority training set, degrading sample
+        # quality.  8 samples/feature is a standard rule-of-thumb for minimum
+        # reliable capacity estimation in high-dimensional regression/diffusion.
+        minority_spf = minority_count / max(n_features, 1)
+        n_blocks = 4 if minority_spf >= 8 else 2
     elif n_features > 20:
         n_blocks = 3
     else:

@@ -22,6 +22,11 @@ from .spectral_scheduler import SpectralCurriculumScheduler
 from .riemannian_privacy import RiemannianPrivacyFilter
 from .denoiser import MATDiffDenoiser
 
+# Minimum real minority samples required to trust the denoiser contribution.
+# Below this threshold the denoiser is likely overfit, so _light_refinement
+# falls back to a conservative SMOTE-dominant blend (ratio 0.2 vs 0.5).
+_MIN_REAL_FOR_DENOISER_TRUST = 50
+
 
 class MATDiffPipeline:
     """End-to-end MAT-Diff training and sampling pipeline."""
@@ -404,11 +409,14 @@ class MATDiffPipeline:
             
             print(f"  Sampling class {class_label}: {n_needed} samples (real={n_real})...")
 
-            n_generate = min(int(n_needed * 1.2), 12000)
+            # Generate 20% extra samples so DMF can filter to exactly n_needed.
+            # No upper cap: capping at 12000 previously caused severe under-sampling
+            # for large-deficit datasets (e.g. bank_full needs ~35k, avila ~20k).
+            n_generate = int(n_needed * 1.2)
             
             # HYBRID: SMOTE base + light diffusion refinement
             X_base = self._smote_base(X_real_c, n_generate, rng=rng)
-            X_refined = self._light_refinement(X_base, class_label, n_steps=5)
+            X_refined = self._light_refinement(X_base, class_label, n_steps=5, n_real=n_real)
             X_final = self._adaptive_noise_injection(X_refined, class_label)
             X_final = np.clip(X_final, 0.0, 1.0)
             
@@ -449,7 +457,7 @@ class MATDiffPipeline:
         
         return np.array(synthetic)
 
-    def _light_refinement(self, X_base, class_label, n_steps=10):
+    def _light_refinement(self, X_base, class_label, n_steps=10, n_real=None):
         """Multi-step diffusion refinement with CONSERVATIVE blend."""
         if int(class_label) not in self.denoisers:
             return X_base
@@ -466,7 +474,9 @@ class MATDiffPipeline:
                 pred_mean = noise_pred.abs().mean().item()
             
             # If denoiser is untrained (high output), trust it less
-            if pred_mean > 1.0:
+            if n_real is not None and n_real < _MIN_REAL_FOR_DENOISER_TRUST:
+                blend_ratio = 0.2  # Very small minority: denoiser likely overfit, trust SMOTE more
+            elif pred_mean > 1.0:
                 print(f"    ⚠️ Denoiser untrained (pred_mean={pred_mean:.2f}), using 30/70 blend")
                 blend_ratio = 0.3  # Trust SMOTE more
             else:

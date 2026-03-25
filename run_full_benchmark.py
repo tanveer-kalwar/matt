@@ -413,8 +413,11 @@ def apply_tabddpm_resample(X_tr, y_tr, seed, device='cpu'):
                 
                 optimizer = torch.optim.AdamW(diffusion.parameters(), lr=2e-4, 
                                               weight_decay=1e-5, betas=(0.9, 0.999))
-                epochs = min(200, max(50, len(X_minority) // 2))
-                batch_size = min(64, len(X_minority))
+                # Fixed canonical settings for fair baseline comparison — do not adapt to data size.
+                # epochs=100 is a standard fixed budget; batch_size is capped at 256 (canonical TabDDPM)
+                # but floored at 32 to keep gradient estimates stable for tiny minority classes.
+                epochs = 100
+                batch_size = min(256, max(32, len(X_minority)))
                 
                 diffusion.train()
                 X_tensor = torch.FloatTensor(X_minority_norm).to(device)
