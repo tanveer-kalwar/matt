@@ -87,8 +87,16 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
         # e.g., pair_0_5 → keep only classes 0 and 5
         parts = rule[5:].split("_")
         mask = np.isin(y_str, parts)
-        # Return the full mask and labels for filtering
-        return mask  # Caller must filter X too
+
+        # If string matching fails (numeric labels like 0.0/5.0), try numeric compare
+        if mask.sum() == 0:
+            y_num = pd.to_numeric(pd.Series(y_str), errors="coerce")
+            part_nums = pd.to_numeric(pd.Series(parts), errors="coerce").dropna().tolist()
+            if len(part_nums) > 0:
+                mask = y_num.isin(part_nums).fillna(False).values
+
+        # Return the full mask for caller-side filtering
+        return mask
 
     elif rule == "pair_AB":
         mask = np.isin(y_str, ["A", "B", "1", "2"])

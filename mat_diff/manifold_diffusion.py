@@ -341,11 +341,13 @@ class MATDiffPipeline:
         # ANI permanently disabled – return input unchanged
         return x_interpolated
 
-    def _distribution_matching_filter(self, X_syn, X_real, n_keep):
+    def _distribution_matching_filter(self, X_syn, X_real, n_keep, rng=None):
         """
         Safe-DMF: Only removes the absolute worst 5% outliers.
         Ensures MAT-Diff preserves the diversity needed to beat 'w/o DMF'.
         """
+        if rng is None:
+            rng = np.random
         if len(X_syn) <= n_keep or not self.use_dmf:
             return X_syn[:n_keep]
         
@@ -367,14 +369,16 @@ class MATDiffPipeline:
         scores = np.exp(-avg_dist / (max_allowable_dist * 2.0 + 1e-6))
         probs = scores / scores.sum()
         
-        idx = np.random.choice(len(X_syn), n_keep, replace=False, p=probs)
+        idx = rng.choice(len(X_syn), n_keep, replace=False, p=probs)
         return X_syn[idx]
         
-    def sample(self, n_per_class=None):
+    def sample(self, n_per_class=None, seed: Optional[int] = None):
         """Generate synthetic samples using hybrid SMOTE + diffusion refinement."""
         if not self.denoisers:
             print(f"  [MATDiff] sample: use_dmf={self.use_dmf}")
             raise RuntimeError("Call fit() before sample().")
+
+        rng = np.random.RandomState(seed) if seed is not None else np.random
 
         if n_per_class is None:
             class_counts = dict(zip(*np.unique(self.y_train, return_counts=True)))
@@ -403,13 +407,13 @@ class MATDiffPipeline:
             n_generate = min(int(n_needed * 1.2), 12000)
             
             # HYBRID: SMOTE base + light diffusion refinement
-            X_base = self._smote_base(X_real_c, n_generate)
+            X_base = self._smote_base(X_real_c, n_generate, rng=rng)
             X_refined = self._light_refinement(X_base, class_label, n_steps=5)
             X_final = self._adaptive_noise_injection(X_refined, class_label)
             X_final = np.clip(X_final, 0.0, 1.0)
             
             # Apply DMF to select best samples
-            X_syn_filtered = self._distribution_matching_filter(X_final, X_real_c, n_needed)
+            X_syn_filtered = self._distribution_matching_filter(X_final, X_real_c, n_needed, rng=rng)
             
             if len(X_syn_filtered) > 0:
                 all_X.append(X_syn_filtered)
@@ -420,8 +424,10 @@ class MATDiffPipeline:
 
         return np.vstack(all_X), np.concatenate(all_y)
 
-    def _smote_base(self, X_real, n_generate):
+    def _smote_base(self, X_real, n_generate, rng=None):
         """Generate base samples using SMOTE interpolation."""
+        if rng is None:
+            rng = np.random
         n_real = len(X_real)
         if n_real < 2:
             return np.tile(X_real, (n_generate // max(1, n_real) + 1, 1))[:n_generate]
@@ -433,11 +439,11 @@ class MATDiffPipeline:
         
         synthetic = []
         for _ in range(n_generate):
-            i = np.random.randint(0, n_real)
-            j = indices[i, np.random.randint(1, k + 1)]
+            i = rng.randint(0, n_real)
+            j = indices[i, rng.randint(1, k + 1)]
             
             # Random interpolation
-            alpha = np.random.random()
+            alpha = rng.random()
             x_new = X_real[i] + alpha * (X_real[j] - X_real[i])
             synthetic.append(x_new)
         
