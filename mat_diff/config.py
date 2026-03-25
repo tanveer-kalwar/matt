@@ -144,11 +144,11 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     # CRITICAL: minority-only training means model sees far fewer samples.
     # Capacity MUST scale with minority count, not total dataset size.
     minority_count = max(10, int(n_samples / max(ir, 2)))
-    if minority_count < 200:
+    if minority_count < 100:
         d_model = 64
-    elif minority_count < 500:
+    elif minority_count < 300:
         d_model = max(64, min(128, d_model // 2))
-    elif minority_count < 1000:
+    elif minority_count < 750:
         d_model = max(64, min(192, d_model))
 
     if spf < 10:
@@ -187,7 +187,7 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     # BUT: Cap more aggressively to prevent overfitting
     base_epochs = 500  # REDUCED from 500
     ir_bonus = int(80 * math.log2(max(ir, 1)))
-    epochs = min(1200, base_epochs + ir_bonus) 
+    epochs = min(1500, base_epochs + ir_bonus) 
     if n_samples < 500:
         epochs = min(epochs, 800)
 
