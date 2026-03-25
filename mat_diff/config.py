@@ -8,17 +8,22 @@ Design principles:
     - Standard ML constants (learning rate ranges, architecture sizes)
 
 Hyperparameter derivation rules:
-    d_model:  min(256, max(64, 2^ceil(log2(n_features * 4))))
-              Representation capacity scales with input dimension
-    n_blocks: 2 if n_features <= 20, else 3
-              Deeper networks for higher-dimensional inputs
-    n_heads:  max(2,  // 64)
-              Each attention head handles approximately 64 dimensions
-    batch_size: min(256, max(32, n_samples // 8))
-              Approximately 8 batches per epoch for stable gradient estimates
-    epochs:   Scaled by IR: base=500, +80*log2(IR), capped at 1500
-              Higher imbalance requires longer training
-    lr:       1e-3
+    d_model:    min(256, max(64, 2^ceil(log2(n_features * 4))))
+                Representation capacity scales with input dimension
+    d_hidden:   6 * d_model (universal)
+                Richer FFN for stronger representation power
+    n_blocks:   2 if n_features <= 20, else 3
+                Deeper networks for higher-dimensional inputs
+    n_heads:    max(2, d_model // 64)
+                Each attention head handles approximately 64 dimensions
+    batch_size: if N_minor > 256: min(512, max(16, N_minor // 4))
+                else:             min(128, max(16, N_minor // 4))
+                Larger batches allowed when data is sufficient
+    epochs:     Scaled by IR: base=500, +80*log2(IR), capped at 2000;
+                never less than 500 after budget cap
+    n_phases:   Derived from n_features/spf; guaranteed >= 2 when N_minor > 300
+    dropout:    0.0 when N_minor > 256 (adequate samples → no regularisation bias)
+    lr:         1e-3
 
 """
 
@@ -178,16 +183,20 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     n_heads = max(2, n_heads)
 
     # Smaller batches for minority-only training (typically 100-500 samples)
+    # For N_minor > 256 allow up to 512 to keep large-data runs fast while
+    # providing stable gradient estimates; otherwise keep the conservative 128 cap.
     minority_estimate = max(10, n_samples // max(ir, 2))
-    batch_size = min(128, max(16, minority_estimate // 4))
+    if minority_estimate > 256:
+        batch_size = min(512, max(16, minority_estimate // 4))
+    else:
+        batch_size = min(128, max(16, minority_estimate // 4))
     batch_size = 2 ** round(math.log2(max(16, batch_size)))
 
     # More epochs needed because training on minority data only (much smaller)
-    # More epochs needed because training on minority data only (much smaller)
-    # BUT: Cap more aggressively to prevent overfitting
-    base_epochs = 500  # REDUCED from 500
+    # BUT: Cap to prevent overfitting while still allowing sufficient training.
+    base_epochs = 500
     ir_bonus = int(80 * math.log2(max(ir, 1)))
-    epochs = min(1500, base_epochs + ir_bonus) 
+    epochs = min(2000, base_epochs + ir_bonus)
     if n_samples < 500:
         epochs = min(epochs, 800)
 
@@ -205,16 +214,17 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
     batches_per_epoch_est = max(1, minority_total_estimate // batch_size)
     epochs_from_budget = max(MIN_EPOCHS, TARGET_STEPS // batches_per_epoch_est)
     epochs = min(epochs, epochs_from_budget)
+    # Never train fewer than 500 epochs, regardless of budget cap
+    epochs = max(500, epochs)
 
-    # d_hidden: 4x d_model (standard transformer ratio)
-    d_hidden = d_model * 4
+    # d_hidden: 6x d_model (was 4x) for stronger representation power
+    d_hidden = d_model * 6
 
     # n_phases: Only use multiple phases if enough features to partition,
     # enough samples per feature, AND enough minority samples to fit the
     # spectral decomposition on. With < 50 minority samples, fitting PCA/SVD
     # phases is fitting noise (19 samples → n_phases=1 mandatory).
-    minority_count_for_phases = max(10, int(n_samples / max(ir, 2)))
-    if minority_count_for_phases < 50:
+    if minority_count < 50:
         n_phases = 1
     elif n_features >= 30 and spf >= 10:
         n_phases = 3
@@ -222,8 +232,13 @@ def derive_hyperparams(n_samples: int, n_features: int, n_classes: int, ir: floa
         n_phases = 2
     else:
         n_phases = 1
+    # For N_minor > 300, guarantee at least 2 phases so spectral curriculum
+    # gets a harder stage even for lower-dimensional datasets.
+    if minority_count > 300:
+        n_phases = max(2, n_phases)
 
-    # Regularisation: increase for small/sample-starved datasets
+    # Regularisation: with N_minor > 256 there is adequate data, so dropout is
+    # kept at 0 to minimise regularisation bias.
     dropout = 0.0
     weight_decay = 0.0
 
