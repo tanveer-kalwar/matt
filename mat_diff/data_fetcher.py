@@ -50,6 +50,28 @@ def _download_openml(openml_id: int, dataset_name: str) -> pd.DataFrame:
         )
 
 
+def _download_uci(uci_id: int, dataset_name: str) -> pd.DataFrame:
+    """Download from UCI ML Repository, cache locally."""
+    cache_path = os.path.join(DATA_DIR, f"{dataset_name}.csv")
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path)
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    try:
+        from ucimlrepo import fetch_ucirepo
+        dataset = fetch_ucirepo(id=uci_id)
+        df = pd.concat([dataset.data.features, dataset.data.targets], axis=1)
+        df.to_csv(cache_path, index=False)
+        print(f"    Downloaded {dataset_name} from UCI ML Repository (id={uci_id})")
+        return df
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot download {dataset_name} (UCI id={uci_id}): {e}\n"
+            f"Install: pip install ucimlrepo"
+        )
+
+
 def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = None) -> np.ndarray:
     """Convert multiclass targets to binary using the specified rule."""
     y_str = np.array([str(v).strip() for v in y])
@@ -123,6 +145,12 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     if os.path.exists(local_path):
         df = pd.read_csv(local_path)
         print(f"    Loaded from {local_path}")
+    elif info.get("source") == "uci":
+        if "uci_id" not in info:
+            raise KeyError(
+                f"Dataset '{dataset_name}' has source='uci' but no 'uci_id' in registry."
+            )
+        df = _download_uci(info["uci_id"], dataset_name)
     else:
         df = _download_openml(info["openml_id"], dataset_name)
 
