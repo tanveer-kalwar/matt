@@ -62,29 +62,39 @@ def setup_goio_repo():
                 except (IOError, OSError):
                     pass
 
-    # Fix num_col_idx off-by-one in dataprocessing.py:
-    # GOIO mistakenly includes the target column index in num_col_idx
-    # (e.g. range(n_num_features + 1) instead of range(n_num_features)),
-    # which causes IndexError when indexing into feature-only arrays.
+    # Fix num_col_idx generation in dataprocessing.py:
+    # Root cause: data_GOIO iterates over ALL columns in the dataset JSON
+    # (including the last/target column) when building num_col_idx.  For
+    # datasets with 10+ classes, data_description() assigns the target column
+    # type "ordinal" instead of "label", so data_GOIO incorrectly adds the
+    # target column index (== n_features) into num_col_idx.  This causes
+    #   X_num_test = xtest[:, num_col_idx]   → IndexError: index N out of bounds
+    # because xtest already has the target stripped (shape: (m, n_features)).
+    #
+    # Fix: limit the data_GOIO column loop to feature columns only by slicing
+    # [:-1] to exclude the last (target) column entry from the JSON.
     dp_path = os.path.join(repo_dir, "data", "dataprocessing.py")
     if os.path.exists(dp_path):
         try:
             with open(dp_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            # Fix: num_col_idx = list(range(EXPR + 1)) -> list(range(EXPR))
-            # This removes the erroneous +1 that causes the target column
-            # index to be included in num_col_idx.
+            modified = content
+
+            # Primary fix: exclude last (target) column from data_GOIO loop.
+            # Before: for i, ds in enumerate(data_info['columns']):
+            # After:  for i, ds in enumerate(data_info['columns'][:-1]):
+            modified = modified.replace(
+                "for i, ds in enumerate(data_info['columns']):",
+                "for i, ds in enumerate(data_info['columns'][:-1]):  # exclude target col"
+            )
+
+            # Secondary fix (legacy guard): remove erroneous +1 from any
+            # range()-based num_col_idx construction, e.g.
+            #   num_col_idx = list(range(n_num_features + 1))
             modified = re.sub(
                 r'(num_col_idx\s*=\s*list\(range\()([^)]+?)\s*\+\s*1(\)\))',
                 r'\1\2\3',
-                content
-            )
-
-            # Also fix: num_col_idx = list(range(info[...] + 1)) variant
-            modified = re.sub(
-                r"(num_col_idx\s*=\s*list\(range\(info\[['\"]n_num_features['\"]\])(\s*\+\s*1)(\)\))",
-                r'\1\3',
                 modified
             )
 
@@ -92,6 +102,8 @@ def setup_goio_repo():
                 with open(dp_path, 'w', encoding='utf-8') as f:
                     f.write(modified)
                 print("  Patched num_col_idx in dataprocessing.py")
+            else:
+                print("  Warning: dataprocessing.py patch pattern not found -- GOIO may still fail")
         except Exception as e:
             print(f"  Warning: could not patch dataprocessing.py: {e}")
 
@@ -130,7 +142,13 @@ def prepare_goio_dataset(dataset_name, X_train, y_train, repo_dir):
     
     with open(f"{data_dir}/info.json", 'w') as f:
         json.dump(info, f, indent=2)
-    
+
+    # Validate: feature column indices must be exactly 0..n_features-1.
+    # The target column (at index n_features in the CSV) must NEVER appear.
+    num_col_idx = list(range(n_features))
+    assert min(num_col_idx) == 0 and max(num_col_idx) == n_features - 1, \
+        f"num_col_idx out of range: min={min(num_col_idx)}, max={max(num_col_idx)}, expected 0..{n_features-1}"
+
     print(f"      ✓ Saved CSV: {csv_path}")
     print(f"      ✓ Saved info.json: {n_features} features, {n_classes} classes")
     return n_features
