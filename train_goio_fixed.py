@@ -3,6 +3,7 @@
 GOIO Training - Properly integrated with GOIO repository structure
 """
 import os
+import re
 import sys
 import subprocess
 import numpy as np
@@ -32,8 +33,7 @@ def setup_goio_repo():
     
     # Fix verbose=True in ReduceLROnPlateau across ALL Python files
     print("  Patching verbose parameter...")
-    import re
-    
+
     for root, dirs, files in os.walk(repo_dir):
         for filename in files:
             if filename.endswith('.py'):
@@ -64,26 +64,24 @@ def setup_goio_repo():
 
     # Fix column classification in dataprocessing.py:
     #
-    # Root cause (data_description): For datasets with >= 10 unique class
-    # labels (e.g. yeast=10, students_dropout, etc.), the target column's
-    # counts_len is >= 10, so the guard `(counts_len < 10)` is False and
-    # data_description() classifies the target as "ordinal" instead of
-    # "categorical"/"label".  data_GOIO() then appends the target column
-    # index (== n_features) into num_col_idx because it matches the
-    # `ds['type'] == 'ordinal'` branch.  The subsequent
+    # Root cause: data_description() classifies the target column as "ordinal"
+    # when counts_len >= 10 (e.g. students_dropout has 31 classes).  data_GOIO()
+    # then appends the target column index (== n_features) into num_col_idx
+    # because it matches the `ds['type'] == 'ordinal'` branch.  The subsequent
     #   X_num_test = xtest[:, num_col_idx]
-    # fails with IndexError because xtest has already had the target
-    # stripped (shape: (m, n_features)) so index n_features is out of bounds.
+    # fails with IndexError because xtest is already stripped of the target
+    # column (shape (m, n_features)), so index n_features is out of bounds.
     #
-    # Primary fix (data_description): extend the condition that enters the
-    # categorical/label branch to ALSO fire when i is the last column,
-    # regardless of counts_len.  This ensures the target is always written
-    # as {"type": "categorical", "name": "label", ...} even for high-
-    # class-count datasets.
-    #
-    # Belt-and-suspenders fix (data_GOIO): limit the column loop to feature
-    # columns only via [:-1] so the target entry is never processed even if
-    # data_description() somehow still writes it as "ordinal".
+    # Fix strategy (robust):
+    #   1. Inject a post-loop block inside data_description() that re-classifies
+    #      the last json_SOS entry as "categorical"/"label" regardless of how
+    #      many unique values the target column has.  We detect the injection
+    #      point using a regex so the fix is insensitive to exact indentation
+    #      or minor code-style differences.
+    #   2. Belt-and-suspenders: in data_GOIO() limit the columns loop to
+    #      [:-1] so the target entry is never added to num_col_idx / cat_col_idx
+    #      even if the JSON is somehow wrong.
+
     dp_path = os.path.join(repo_dir, "data", "dataprocessing.py")
     if os.path.exists(dp_path):
         try:
@@ -92,24 +90,55 @@ def setup_goio_repo():
 
             modified = content
 
-            # Primary fix: make the last column (target) always enter the
-            # categorical/label branch in data_description(), regardless of
-            # how many unique class values it contains.
-            # Before: if (counts_len < 10) & (min(counts_value) >= 0):
-            # After:  if ((counts_len < 10) & (min(counts_value) >= 0)) or (i == data.shape[1]-1):
-            modified = modified.replace(
-                "            if (counts_len < 10) & (min(counts_value) >= 0):",
-                "            if ((counts_len < 10) & (min(counts_value) >= 0)) or (i == data.shape[1]-1):  # last col is always the label"
-            )
+            # ----------------------------------------------------------------
+            # Fix 1 – inject post-loop label-fix into data_description().
+            # We insert a block just before the `json_SOS_final = {...}` line.
+            # The injected block ensures json_SOS[-1] is always
+            # {"name": "label", "type": "categorical", ...} regardless of the
+            # number of unique class values.
+            # ----------------------------------------------------------------
+            _LABEL_FIX_MARKER = "# _goio_label_fix_applied"
+            if _LABEL_FIX_MARKER not in modified:
+                # Build the injection text using the same indentation as the
+                # json_SOS_final line (captured via regex group 1).
+                _inject = (
+                    "{indent}" + _LABEL_FIX_MARKER + "\n"
+                    "{indent}# Ensure last column (target) is always label/categorical\n"
+                    "{indent}if json_SOS and (\n"
+                    "{indent}        json_SOS[-1].get('type') != 'categorical' or\n"
+                    "{indent}        json_SOS[-1].get('name') != 'label'):\n"
+                    "{indent}    _last_vals = sorted(list(Counter(data[:, -1]).keys()))\n"
+                    "{indent}    json_SOS[-1] = {\n"
+                    "{indent}        'i2s': _last_vals,\n"
+                    "{indent}        'name': 'label',\n"
+                    "{indent}        'size': len(_last_vals),\n"
+                    "{indent}        'type': 'categorical',\n"
+                    "{indent}    }\n"
+                )
 
-            # Belt-and-suspenders: also exclude last (target) column from
-            # the data_GOIO column loop so it is never added to num_col_idx
-            # even if the JSON description is somehow still wrong.
-            # Before: for i, ds in enumerate(data_info['columns']):
-            # After:  for i, ds in enumerate(data_info['columns'][:-1]):
-            modified = modified.replace(
-                "for i, ds in enumerate(data_info['columns']):",
-                "for i, ds in enumerate(data_info['columns'][:-1]):  # exclude target col"
+                def _build_replacement(m):
+                    indent = m.group(1)
+                    block = _inject.replace("{indent}", indent)
+                    return block + m.group(0)
+
+                modified = re.sub(
+                    r'^([ \t]*)json_SOS_final\s*=\s*\{',
+                    _build_replacement,
+                    modified,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+
+            # ----------------------------------------------------------------
+            # Fix 2 – belt-and-suspenders: in data_GOIO() iterate only over
+            # feature columns (exclude the last "label" entry from the loop).
+            # This catches any edge case where Fix 1 didn't fire.
+            # ----------------------------------------------------------------
+            modified = re.sub(
+                r'([ \t]*)for\s+i\s*,\s*ds\s+in\s+enumerate\(data_info\[.columns.\]\)\s*:',
+                lambda m: m.group(1) + "for i, ds in enumerate(data_info['columns'][:-1]):  # exclude target col",
+                modified,
+                count=1,
             )
 
             if modified != content:
@@ -117,7 +146,7 @@ def setup_goio_repo():
                     f.write(modified)
                 print("  Patched data_description/data_GOIO in dataprocessing.py")
             else:
-                print("  Warning: dataprocessing.py patch pattern not found -- GOIO may still fail")
+                print("  dataprocessing.py already patched (skipping)")
         except Exception as e:
             print(f"  Warning: could not patch dataprocessing.py: {e}")
 
@@ -126,42 +155,67 @@ def setup_goio_repo():
 
 
 def prepare_goio_dataset(dataset_name, X_train, y_train, repo_dir):
-    """Prepare dataset in GOIO's expected format with info.json"""
-    
+    """Prepare dataset in GOIO's expected format with info.json.
+
+    The saved CSV must contain exactly n_features numeric (float) feature
+    columns followed by one integer target column – the target MUST NOT be
+    appended to X.  info.json records n_features == X_train.shape[1] so
+    that GOIO's data pipeline never mistakes the target for a feature.
+    """
+
     data_dir = f"{repo_dir}/data/datasets/{dataset_name}"
     os.makedirs(data_dir, exist_ok=True)
-    
+
+    # n_features is the number of FEATURE columns – target is separate.
     n_features = X_train.shape[1]
     n_classes = len(np.unique(y_train))
-    
-    # Create CSV
+
+    # Build the DataFrame with explicit dtypes:
+    #   - feature columns: float64  (no mixed/object dtype)
+    #   - target column  : int64    (integer class labels)
     col_names = [f'num_{i}' for i in range(n_features)]
-    df = pd.DataFrame(X_train, columns=col_names)
-    df['target'] = y_train.astype(int)
-    
+    X_float = np.asarray(X_train, dtype=np.float64)
+    y_int = np.asarray(y_train, dtype=np.int64)
+
+    df_features = pd.DataFrame(X_float, columns=col_names)
+    df_target = pd.Series(y_int, name="target")
+
+    # Concatenate: target is a SEPARATE series, NOT appended to X.
+    df = pd.concat([df_features, df_target], axis=1)
+
     csv_path = f"{data_dir}/{dataset_name}.csv"
     df.to_csv(csv_path, index=False)
-    
-    # Create info.json (CRITICAL - GOIO needs this)
+
+    # Assertions: CSV must have exactly n_features+1 columns with the
+    # target as the very last column, and n_features must match X.shape[1].
+    _saved = pd.read_csv(csv_path)
+    assert _saved.shape[1] == n_features + 1, (
+        f"CSV column count mismatch: got {_saved.shape[1]}, "
+        f"expected {n_features + 1} (n_features={n_features})"
+    )
+    assert _saved.columns[-1] == "target", (
+        f"Last CSV column must be 'target', got '{_saved.columns[-1]}'"
+    )
+    assert n_features == X_train.shape[1], (
+        f"n_features ({n_features}) != X_train.shape[1] ({X_train.shape[1]})"
+    )
+
+    # Create info.json for GOIO's MLVAE/CLDM training scripts.
+    # n_features == X.shape[1] (features only, NOT including target).
     info = {
         "name": dataset_name,
         "task_type": "binclass" if n_classes == 2 else "multiclass",
         "n_num_features": n_features,
+        "n_features": n_features,
         "n_cat_features": 0,
         "train_size": len(X_train),
         "val_size": 0,
         "test_size": 0,
-        "n_classes": n_classes if n_classes > 2 else 0
+        "n_classes": n_classes if n_classes > 2 else 0,
     }
-    
+
     with open(f"{data_dir}/info.json", 'w') as f:
         json.dump(info, f, indent=2)
-
-    # Validate: feature column indices must be exactly 0..n_features-1.
-    # The target column (at index n_features in the CSV) must NEVER appear.
-    num_col_idx = list(range(n_features))
-    assert min(num_col_idx) == 0 and max(num_col_idx) == n_features - 1, \
-        f"num_col_idx out of range: min={min(num_col_idx)}, max={max(num_col_idx)}, expected 0..{n_features-1}"
 
     print(f"      ✓ Saved CSV: {csv_path}")
     print(f"      ✓ Saved info.json: {n_features} features, {n_classes} classes")
