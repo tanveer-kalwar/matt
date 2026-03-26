@@ -59,9 +59,42 @@ def setup_goio_repo():
                     if modified != content:
                         with open(filepath, 'w', encoding='utf-8') as f:
                             f.write(modified)
-                except:
+                except (IOError, OSError):
                     pass
-    
+
+    # Fix num_col_idx off-by-one in dataprocessing.py:
+    # GOIO mistakenly includes the target column index in num_col_idx
+    # (e.g. range(n_num_features + 1) instead of range(n_num_features)),
+    # which causes IndexError when indexing into feature-only arrays.
+    dp_path = os.path.join(repo_dir, "data", "dataprocessing.py")
+    if os.path.exists(dp_path):
+        try:
+            with open(dp_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # Fix: num_col_idx = list(range(EXPR + 1)) -> list(range(EXPR))
+            # This removes the erroneous +1 that causes the target column
+            # index to be included in num_col_idx.
+            modified = re.sub(
+                r'(num_col_idx\s*=\s*list\(range\()([^)]+?)\s*\+\s*1(\)\))',
+                r'\1\2\3',
+                content
+            )
+
+            # Also fix: num_col_idx = list(range(info[...] + 1)) variant
+            modified = re.sub(
+                r"(num_col_idx\s*=\s*list\(range\(info\[['\"]n_num_features['\"]\])(\s*\+\s*1)(\)\))",
+                r'\1\3',
+                modified
+            )
+
+            if modified != content:
+                with open(dp_path, 'w', encoding='utf-8') as f:
+                    f.write(modified)
+                print("  Patched num_col_idx in dataprocessing.py")
+        except Exception as e:
+            print(f"  Warning: could not patch dataprocessing.py: {e}")
+
     print("  Patching complete")
     return repo_dir
 
