@@ -62,17 +62,28 @@ def setup_goio_repo():
                 except (IOError, OSError):
                     pass
 
-    # Fix num_col_idx generation in dataprocessing.py:
-    # Root cause: data_GOIO iterates over ALL columns in the dataset JSON
-    # (including the last/target column) when building num_col_idx.  For
-    # datasets with 10+ classes, data_description() assigns the target column
-    # type "ordinal" instead of "label", so data_GOIO incorrectly adds the
-    # target column index (== n_features) into num_col_idx.  This causes
-    #   X_num_test = xtest[:, num_col_idx]   → IndexError: index N out of bounds
-    # because xtest already has the target stripped (shape: (m, n_features)).
+    # Fix column classification in dataprocessing.py:
     #
-    # Fix: limit the data_GOIO column loop to feature columns only by slicing
-    # [:-1] to exclude the last (target) column entry from the JSON.
+    # Root cause (data_description): For datasets with >= 10 unique class
+    # labels (e.g. yeast=10, students_dropout, etc.), the target column's
+    # counts_len is >= 10, so the guard `(counts_len < 10)` is False and
+    # data_description() classifies the target as "ordinal" instead of
+    # "categorical"/"label".  data_GOIO() then appends the target column
+    # index (== n_features) into num_col_idx because it matches the
+    # `ds['type'] == 'ordinal'` branch.  The subsequent
+    #   X_num_test = xtest[:, num_col_idx]
+    # fails with IndexError because xtest has already had the target
+    # stripped (shape: (m, n_features)) so index n_features is out of bounds.
+    #
+    # Primary fix (data_description): extend the condition that enters the
+    # categorical/label branch to ALSO fire when i is the last column,
+    # regardless of counts_len.  This ensures the target is always written
+    # as {"type": "categorical", "name": "label", ...} even for high-
+    # class-count datasets.
+    #
+    # Belt-and-suspenders fix (data_GOIO): limit the column loop to feature
+    # columns only via [:-1] so the target entry is never processed even if
+    # data_description() somehow still writes it as "ordinal".
     dp_path = os.path.join(repo_dir, "data", "dataprocessing.py")
     if os.path.exists(dp_path):
         try:
@@ -81,7 +92,19 @@ def setup_goio_repo():
 
             modified = content
 
-            # Primary fix: exclude last (target) column from data_GOIO loop.
+            # Primary fix: make the last column (target) always enter the
+            # categorical/label branch in data_description(), regardless of
+            # how many unique class values it contains.
+            # Before: if (counts_len < 10) & (min(counts_value) >= 0):
+            # After:  if ((counts_len < 10) & (min(counts_value) >= 0)) or (i == data.shape[1]-1):
+            modified = modified.replace(
+                "            if (counts_len < 10) & (min(counts_value) >= 0):",
+                "            if ((counts_len < 10) & (min(counts_value) >= 0)) or (i == data.shape[1]-1):  # last col is always the label"
+            )
+
+            # Belt-and-suspenders: also exclude last (target) column from
+            # the data_GOIO column loop so it is never added to num_col_idx
+            # even if the JSON description is somehow still wrong.
             # Before: for i, ds in enumerate(data_info['columns']):
             # After:  for i, ds in enumerate(data_info['columns'][:-1]):
             modified = modified.replace(
@@ -89,19 +112,10 @@ def setup_goio_repo():
                 "for i, ds in enumerate(data_info['columns'][:-1]):  # exclude target col"
             )
 
-            # Secondary fix (legacy guard): remove erroneous +1 from any
-            # range()-based num_col_idx construction, e.g.
-            #   num_col_idx = list(range(n_num_features + 1))
-            modified = re.sub(
-                r'(num_col_idx\s*=\s*list\(range\()([^)]+?)\s*\+\s*1(\)\))',
-                r'\1\2\3',
-                modified
-            )
-
             if modified != content:
                 with open(dp_path, 'w', encoding='utf-8') as f:
                     f.write(modified)
-                print("  Patched num_col_idx in dataprocessing.py")
+                print("  Patched data_description/data_GOIO in dataprocessing.py")
             else:
                 print("  Warning: dataprocessing.py patch pattern not found -- GOIO may still fail")
         except Exception as e:
