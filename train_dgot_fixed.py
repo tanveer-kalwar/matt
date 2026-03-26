@@ -39,10 +39,15 @@ def prepare_data_for_dgot(dataset_name, X_train, y_train, repo_dir, fold=0):
     With shape (N, 1, features) for xtrain.npy
     Also needs TEST data
     """
-    # Logic-neutral padding: ensures D >= 16 for convolutional kernel compatibility
-    if X_train.shape[1] < 16:
-        pad_width = 16 - X_train.shape[1]
-        X_train = np.pad(X_train, ((0, 0), (0, pad_width)), mode='constant')
+    # Logic-neutral padding: ensures feature_len is a power of 2 for
+    # CUDA kernel compatibility (many GPU operations require power-of-2
+    # alignment; e.g. 116 -> 128).  This is why students_dropout (116
+    # features) fails while datasets with <=16 features (padded to 16)
+    # succeed.
+    orig_dim = X_train.shape[1]
+    target_dim = 1 << (max(orig_dim, 1) - 1).bit_length()
+    if orig_dim < target_dim:
+        X_train = np.pad(X_train, ((0, 0), (0, target_dim - orig_dim)), mode='constant')
     # Create DGOT directory
     data_dir = f"{repo_dir}/datasets/{dataset_name}/DGOT/exp{fold}"
     os.makedirs(data_dir, exist_ok=True)

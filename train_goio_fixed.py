@@ -157,10 +157,11 @@ def setup_goio_repo():
 def prepare_goio_dataset(dataset_name, X_train, y_train, repo_dir):
     """Prepare dataset in GOIO's expected format with info.json.
 
-    The saved CSV must contain exactly n_features numeric (float) feature
-    columns followed by one integer target column – the target MUST NOT be
-    appended to X.  info.json records n_features == X_train.shape[1] so
-    that GOIO's data pipeline never mistakes the target for a feature.
+    The saved CSV has exactly n_features float64 feature columns (named f0,
+    f1, ..., fN) followed by one 'Target' column containing integer class
+    labels.  All values in the matrix are clean float64 (never np.object,
+    never ragged) because we use np.concatenate before building the DataFrame.
+    info.json records n_features == X_train.shape[1].
     """
 
     data_dir = f"{repo_dir}/data/datasets/{dataset_name}"
@@ -170,35 +171,41 @@ def prepare_goio_dataset(dataset_name, X_train, y_train, repo_dir):
     n_features = X_train.shape[1]
     n_classes = len(np.unique(y_train))
 
-    # Build the DataFrame with explicit dtypes:
-    #   - feature columns: float64  (no mixed/object dtype)
-    #   - target column  : int64    (integer class labels)
-    col_names = [f'num_{i}' for i in range(n_features)]
+    # Step 1: ensure X is a clean 2D float64 matrix, y is a 1D int array.
     X_float = np.asarray(X_train, dtype=np.float64)
-    y_int = np.asarray(y_train, dtype=np.int64)
+    y_int = np.asarray(y_train, dtype=np.int64).reshape(-1)
 
-    df_features = pd.DataFrame(X_float, columns=col_names)
-    df_target = pd.Series(y_int, name="target")
+    # Step 2: concatenate as a single float64 matrix so there are no mixed
+    # dtypes or object columns.  Target values (0, 1, 2, ...) become float64
+    # (0.0, 1.0, 2.0, ...) which CSV readers parse cleanly.
+    combined = np.concatenate([X_float, y_int.reshape(-1, 1)], axis=1)
 
-    # Concatenate: target is a SEPARATE series, NOT appended to X.
-    df = pd.concat([df_features, df_target], axis=1)
+    # Step 3: build DataFrame with canonical column names.
+    col_names = [f'f{i}' for i in range(n_features)] + ['Target']
+    df = pd.DataFrame(combined, columns=col_names)
 
     csv_path = f"{data_dir}/{dataset_name}.csv"
-    df.to_csv(csv_path, index=False)
+    df.to_csv(csv_path, index=False, header=True)
 
-    # Assertions: CSV must have exactly n_features+1 columns with the
-    # target as the very last column, and n_features must match X.shape[1].
+    # Assertions: CSV must have exactly n_features+1 columns, last column
+    # must be 'Target', and all feature dtypes must be numeric.
     _saved = pd.read_csv(csv_path)
     assert _saved.shape[1] == n_features + 1, (
         f"CSV column count mismatch: got {_saved.shape[1]}, "
         f"expected {n_features + 1} (n_features={n_features})"
     )
-    assert _saved.columns[-1] == "target", (
-        f"Last CSV column must be 'target', got '{_saved.columns[-1]}'"
+    assert _saved.columns[-1] == "Target", (
+        f"Last CSV column must be 'Target', got '{_saved.columns[-1]}'"
     )
     assert n_features == X_train.shape[1], (
         f"n_features ({n_features}) != X_train.shape[1] ({X_train.shape[1]})"
     )
+    # Verify CSV round-trip preserved numeric types for all columns
+    # (features are float64; Target was cast to float64 via np.concatenate).
+    for col in _saved.columns:
+        assert pd.api.types.is_numeric_dtype(_saved[col]), (
+            f"Column '{col}' has non-numeric dtype {_saved[col].dtype}"
+        )
 
     # Create info.json for GOIO's MLVAE/CLDM training scripts.
     # n_features == X.shape[1] (features only, NOT including target).
@@ -308,11 +315,17 @@ def collect_goio_samples(dataset_name, repo_dir, n_features):
             # If n_features+1, the last column is the target (to be excluded)
             
             num_cols = []
-            
-            # Pattern 1: Columns named 'num_0', 'num_1', etc.
-            num_cols = [c for c in df.columns if c.startswith('num_')]
-            if len(num_cols) > 0:
-                num_cols = sorted(num_cols, key=lambda x: int(x.split('_')[1]))[:n_features]
+
+            # Pattern 1a: Columns named 'f0', 'f1', etc. (canonical format)
+            f_cols = [c for c in df.columns if re.match(r'^f\d+$', str(c))]
+            if f_cols:
+                num_cols = sorted(f_cols, key=lambda x: int(x[1:]))[:n_features]
+
+            # Pattern 1b: Columns named 'num_0', 'num_1', etc. (legacy format)
+            if not num_cols:
+                num_cols = [c for c in df.columns if c.startswith('num_')]
+                if num_cols:
+                    num_cols = sorted(num_cols, key=lambda x: int(x.split('_')[1]))[:n_features]
             
             # Pattern 2: Numeric string columns '0', '1', '2', etc.
             if len(num_cols) == 0:
