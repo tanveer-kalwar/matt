@@ -105,6 +105,16 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
         y_num = pd.to_numeric(pd.Series(y_str), errors="coerce").fillna(threshold - 1).values
         return (y_num >= threshold).astype(int)
 
+    elif rule == "pair_AB":
+        # isolet: classes A and B; OpenML may return string "A"/"B" or
+        # numeric labels "1"/"2" (ints) or "1.0"/"2.0" (floats).
+        mask = np.isin(y_str, ["A", "B", "1", "2"])
+        if mask.sum() == 0:
+            # Numeric fallback: A=1, B=2 returned as floats (e.g. 1.0 / 2.0)
+            y_num = pd.to_numeric(pd.Series(y_str), errors="coerce")
+            mask = y_num.fillna(-1).isin([1, 2]).values
+        return mask
+
     elif rule.startswith("pair_"):
         # e.g., pair_0_5 → keep only classes 0 and 5
         parts = rule[5:].split("_")
@@ -118,10 +128,6 @@ def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = 
                 mask = y_num.isin(part_nums).fillna(False).values
 
         # Return the full mask for caller-side filtering
-        return mask
-
-    elif rule == "pair_AB":
-        mask = np.isin(y_str, ["A", "B", "1", "2"])
         return mask
 
     else:
