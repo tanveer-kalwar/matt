@@ -184,16 +184,22 @@ def apply_traditional_resampler(method, X_tr, y_tr, seed):
         n_orig = len(y_tr)
         if method == "Original":
             return X_tr, y_tr, None
-        elif method == "SMOTE":
-            Xr, yr = SMOTE(random_state=seed).fit_resample(X_tr, y_tr)
+        # Compute a safe k_neighbors value so methods do not fail when a
+        # minority class has fewer than the default 6 samples (k+1=6).
+        min_class_count = min(Counter(y_tr).values())
+        k = min(5, min_class_count - 1)
+        if k < 1:
+            return None  # Class with a single sample cannot be resampled
+        if method == "SMOTE":
+            Xr, yr = SMOTE(random_state=seed, k_neighbors=k).fit_resample(X_tr, y_tr)
         elif method == "Borderline-SMOTE":
-            Xr, yr = BorderlineSMOTE(random_state=seed, kind="borderline-1").fit_resample(X_tr, y_tr)
+            Xr, yr = BorderlineSMOTE(random_state=seed, kind="borderline-1", k_neighbors=k).fit_resample(X_tr, y_tr)
         elif method == "SMOTE-Tomek":
-            Xr, yr = SMOTETomek(random_state=seed).fit_resample(X_tr, y_tr)
+            Xr, yr = SMOTETomek(random_state=seed, smote=SMOTE(k_neighbors=k, random_state=seed)).fit_resample(X_tr, y_tr)
         elif method == "ADASYN":
-            Xr, yr = ADASYN(random_state=seed).fit_resample(X_tr, y_tr)
+            Xr, yr = ADASYN(random_state=seed, n_neighbors=k).fit_resample(X_tr, y_tr)
         elif method == "KMeansSMOTE":
-            Xr, yr = KMeansSMOTE(random_state=seed, cluster_balance_threshold=0.01).fit_resample(X_tr, y_tr)
+            Xr, yr = KMeansSMOTE(random_state=seed, cluster_balance_threshold=0.01, k_neighbors=k).fit_resample(X_tr, y_tr)
         else:
             return None
         X_syn = Xr[n_orig:] if len(Xr) > n_orig else None
