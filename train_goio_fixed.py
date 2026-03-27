@@ -166,6 +166,17 @@ def prepare_goio_dataset(dataset_name, X_train, y_train, repo_dir):
     data_dir = f"{repo_dir}/data/datasets/{dataset_name}"
     os.makedirs(data_dir, exist_ok=True)
 
+    # NaN guard: GOIO training fails on NaN values — drop affected rows
+    # just-in-time without modifying data for any other method.
+    nan_rows = np.any(np.isnan(X_train), axis=1) | np.isnan(y_train.astype(float))
+    if nan_rows.any():
+        dropped = int(nan_rows.sum())
+        idx_list = np.where(nan_rows)[0].tolist()
+        print(f"      ⚠ NaN guard (GOIO): dropping {dropped} row(s) "
+              f"(first indices: {idx_list[:10]}{'...' if dropped > 10 else ''})")
+        X_train = X_train[~nan_rows]
+        y_train = y_train[~nan_rows]
+
     # n_features is the number of FEATURE columns – target is separate.
     n_features = X_train.shape[1]
     n_classes = len(np.unique(y_train))
@@ -274,6 +285,26 @@ def train_goio_pipeline(dataset_name, repo_dir):
         print(f"        ✗ Failed")
         return False
     print(f"        ✓ Done")
+
+    # Checkpoint guard: CLDM requires the MLVAE checkpoint saved by step 2.
+    # If it is missing (e.g. due to a silent training failure), warn and abort
+    # rather than letting CLDM crash with a cryptic "model.pt not found" error.
+    mlvae_ckpt_dir = os.path.join(
+        repo_dir, "ckpt", dataset_name, "exp0", "MLVAE"
+    )
+    mlvae_ckpt_found = False
+    if os.path.isdir(mlvae_ckpt_dir):
+        mlvae_ckpt_found = any(
+            f.endswith((".pt", ".pth"))
+            for f in os.listdir(mlvae_ckpt_dir)
+            if os.path.isfile(os.path.join(mlvae_ckpt_dir, f))
+        )
+    if not mlvae_ckpt_found:
+        print(
+            f"        ⚠ GOIO checkpoint warning: MLVAE checkpoint not found in "
+            f"{mlvae_ckpt_dir} — CLDM training would fail. Aborting pipeline."
+        )
+        return False
     
     # Step 3: Train CLDM
     print(f"      [3/4] CLDM train...")

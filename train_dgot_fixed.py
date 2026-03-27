@@ -39,6 +39,16 @@ def prepare_data_for_dgot(dataset_name, X_train, y_train, repo_dir, fold=0):
     With shape (N, 1, features) for xtrain.npy
     Also needs TEST data
     """
+    # NaN guard: DGOT cannot handle NaN values — drop any row where X or y is NaN.
+    nan_rows = np.any(np.isnan(X_train), axis=1) | np.isnan(y_train.astype(float))
+    if nan_rows.any():
+        dropped = int(nan_rows.sum())
+        idx_list = np.where(nan_rows)[0].tolist()
+        print(f"      ⚠ NaN guard (DGOT): dropping {dropped} row(s) "
+              f"(first indices: {idx_list[:10]}{'...' if dropped > 10 else ''})")
+        X_train = X_train[~nan_rows]
+        y_train = y_train[~nan_rows]
+
     # Logic-neutral padding: ensures D >= 16 for convolutional kernel compatibility
     if X_train.shape[1] < 16:
         pad_width = 16 - X_train.shape[1]

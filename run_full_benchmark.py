@@ -384,6 +384,17 @@ def apply_tabddpm_resample(X_tr, y_tr, seed, device='cpu'):
         return None
     
     try:
+        # NaN guard: TabDDPM raises FoundNANsError on NaN input; drop affected
+        # rows just-in-time without modifying the caller's arrays.
+        nan_rows = np.any(np.isnan(X_tr), axis=1) | np.isnan(y_tr.astype(float))
+        if nan_rows.any():
+            dropped = int(nan_rows.sum())
+            idx_list = np.where(nan_rows)[0].tolist()
+            print(f"      ⚠ TabDDPM NaN guard: dropping {dropped} row(s) with NaN "
+                  f"(first indices: {idx_list[:10]}{'...' if dropped > 10 else ''})")
+            X_tr = X_tr[~nan_rows]
+            y_tr = y_tr[~nan_rows]
+
         cc = Counter(y_tr)
         maj = max(cc.values())
         X_res, y_res = X_tr.copy(), y_tr.copy()
@@ -473,6 +484,17 @@ def setup_and_train_dgot(dataset_name, X_tr, y_tr, device='cuda'):
         print(f"  └─ train_dgot_fixed.py not found ✗")
         return False
     
+    # NaN guard: DGOT does not tolerate NaN in X or y; drop affected rows
+    # just-in-time without modifying the caller's arrays.
+    nan_rows = np.any(np.isnan(X_tr), axis=1) | np.isnan(y_tr.astype(float))
+    if nan_rows.any():
+        dropped = int(nan_rows.sum())
+        idx_list = np.where(nan_rows)[0].tolist()
+        print(f"  │   ⚠ DGOT NaN guard: dropping {dropped} row(s) with NaN "
+              f"(first indices: {idx_list[:10]}{'...' if dropped > 10 else ''})")
+        X_tr = X_tr[~nan_rows]
+        y_tr = y_tr[~nan_rows]
+
     # Save data to temp files
     temp_dir = Path(tempfile.mkdtemp())
     X_path = temp_dir / "X_train.npy"
@@ -535,7 +557,18 @@ def setup_and_train_goio(dataset_name, X_tr, y_tr, device='cuda'):
     if not goio_script.exists():
         print(f"  └─ train_goio_fixed.py not found ✗")
         return False
-    
+
+    # NaN guard: GOIO does not tolerate NaN in X or y; drop affected rows
+    # just-in-time without modifying the caller's arrays.
+    nan_rows = np.any(np.isnan(X_tr), axis=1) | np.isnan(y_tr.astype(float))
+    if nan_rows.any():
+        dropped = int(nan_rows.sum())
+        idx_list = np.where(nan_rows)[0].tolist()
+        print(f"  │   ⚠ GOIO NaN guard: dropping {dropped} row(s) with NaN "
+              f"(first indices: {idx_list[:10]}{'...' if dropped > 10 else ''})")
+        X_tr = X_tr[~nan_rows]
+        y_tr = y_tr[~nan_rows]
+
     # Save data to temp files
     temp_dir = Path(tempfile.mkdtemp())
     X_path = temp_dir / "X_train.npy"
