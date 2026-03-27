@@ -72,13 +72,49 @@ def _download_uci(uci_id: int, dataset_name: str) -> pd.DataFrame:
         )
 
 
+def _impute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Impute missing values: median for numeric columns, mode for categorical.
+
+    This is necessary for datasets with "?" missing-value markers (e.g. thyroid_sick),
+    where dropping all rows with any NaN would discard almost the entire dataset.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].isnull().any():
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                mode_vals = df[col].mode()
+                # mode() returns empty only when all values are null; 'unknown'
+                # is a safe sentinel that downstream LabelEncoder will handle.
+                fill_val = mode_vals.iloc[0] if len(mode_vals) > 0 else "unknown"
+                df[col] = df[col].fillna(fill_val)
+    return df
+
+
 def _apply_minority_rule(y: np.ndarray, rule: str, df: Optional[pd.DataFrame] = None) -> np.ndarray:
-    """Convert multiclass targets to binary using the specified rule."""
+    """Convert multiclass targets to binary using the specified rule.
+
+    Handles both numeric and string-coded labels robustly:
+    - Never assumes fixed label positions or only two classes.
+    - Falls back to numeric comparison when string matching finds nothing.
+    - Raises a descriptive error (rather than crashing with IndexError) when
+      the input is empty or a rule cannot be applied.
+    """
+    if len(y) == 0:
+        raise ValueError(
+            "_apply_minority_rule received an empty target array. "
+            "The dataset may be empty after preprocessing."
+        )
     y_str = np.array([str(v).strip() for v in y])
 
     if rule == "minority":
         # Most common = 0, everything else = 1
         counts = Counter(y_str)
+        if not counts:
+            raise ValueError(
+                "Target array has no usable values after string conversion."
+            )
         majority = counts.most_common(1)[0][0]
         return (y_str != majority).astype(int)
 
@@ -160,9 +196,14 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
     else:
         df = _download_openml(info["openml_id"], dataset_name)
 
-    # Clean
+    # Clean: replace sentinel missing-value markers with NaN, then impute.
+    # Using imputation (median/mode) instead of dropna() preserves datasets
+    # such as thyroid_sick that have "?" in many rows — dropping NaN there
+    # removes nearly all samples and causes downstream "list index out of range".
     df = df.replace(["?", " ?", "NA", ""], np.nan)
-    df = df.dropna()
+    df = _impute_features(df)
+    # Drop any residual all-NaN rows (edge case)
+    df = df.dropna(how="all")
 
     # Identify target
     target_col = info.get("target", df.columns[-1])
@@ -182,7 +223,24 @@ def load_dataset(dataset_name: str, seed: int = 42) -> Tuple[np.ndarray, np.ndar
         y_raw = y_raw[mask]
         y_str = np.array([str(v).strip() for v in y_raw])
         parts = rule[5:].split("_")
-        y = (y_str == parts[-1]).astype(int)  # Last part is minority
+        # Try exact string match for the minority part first
+        y = (y_str == parts[-1]).astype(int)
+        if y.sum() == 0:
+            # Numeric fallback: labels may be "1.0"/"4.0" instead of "1"/"4"
+            y_num = pd.to_numeric(pd.Series(y_str), errors="coerce")
+            try:
+                target_num = float(parts[-1])
+                y = (y_num == target_num).fillna(False).astype(int).values
+            except (ValueError, TypeError):
+                pass
+            if y.sum() == 0:
+                warnings.warn(
+                    f"pair_ rule '{rule}': minority label '{parts[-1]}' not found "
+                    f"via string or numeric comparison in filtered labels "
+                    f"{np.unique(y_str).tolist()}. Returning all-zeros array.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
     elif is_binary:
         y = _apply_minority_rule(y_raw, rule)
     else:

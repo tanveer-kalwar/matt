@@ -118,6 +118,43 @@ DATASET_REGISTRY = {
     # Yeast
     "yeast":            {"source": "openml", "openml_id": 181,   "target": "class", "binary": False,
                          "minority_rule": "minority", "n_samples": 1484, "n_features": 8, "ir": 28.1},
+
+    # ── New benchmark datasets ──
+
+    # Image (tabular pixel features)
+    # CIFAR-10 flattened: 70 000 samples, 3072 pixel features, 10 balanced classes (IR≈1).
+    # Included to test MAT-Diff on a balanced high-dimensional multi-class setting.
+    "cifar10_tabular":  {"source": "openml", "openml_id": 40978, "target": "class", "binary": False,
+                         "minority_rule": "minority", "n_samples": 70000, "n_features": 3072,
+                         "n_classes": 10, "ir": 1.0},
+
+    # Aerospace / control — classic strong-imbalance benchmark.
+    # 7 classes; class 1 (normal) holds ≈78 % of samples while classes 2/6/7
+    # each have < 20 samples (IR > 7000 for the rarest class vs. majority).
+    # ir=200 is used for hyperparameter derivation as a practical representative
+    # value that avoids extreme architecture choices for the tiny tail classes.
+    "shuttle":          {"source": "openml", "openml_id": 43514, "target": "class", "binary": False,
+                         "minority_rule": "minority", "n_samples": 58000, "n_features": 9,
+                         "n_classes": 7, "ir": 200.0},
+
+    # Medical — thyroid anomaly detection (annthyroid variant).
+    # Binary: normal (≈92 %) vs. thyroid anomaly (≈8 %), IR≈12.5.
+    "thyroid_annthyroid": {"source": "openml", "openml_id": 40536, "target": "class", "binary": True,
+                           "minority_rule": "minority", "n_samples": 7200, "n_features": 21, "ir": 12.5},
+
+    # Medical — fetal cardiotocography monitoring.
+    # Native 3 classes: normal / suspect / pathological (pathological ≈8 %, IR≈10).
+    # binary=True: minority_rule="minority" binarises to pathological vs. rest.
+    # Real-valued CTG signal features; distinct domain from all existing sets.
+    "cardiotocography": {"source": "openml", "openml_id": 1488,  "target": "Class", "binary": True,
+                         "minority_rule": "minority", "n_samples": 2126, "n_features": 21, "ir": 10.0},
+
+    # Industrial — steel surface defect detection.
+    # 7 defect-type classes, 27 real-valued physical-measurement features, IR≈5–15.
+    # Representative of industrial anomaly detection tasks.
+    "steel_plates":     {"source": "openml", "openml_id": 1504,  "target": "Class", "binary": False,
+                         "minority_rule": "minority", "n_samples": 1941, "n_features": 27,
+                         "n_classes": 7, "ir": 10.0},
 }
 
 
