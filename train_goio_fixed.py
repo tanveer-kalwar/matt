@@ -286,25 +286,31 @@ def train_goio_pipeline(dataset_name, repo_dir):
         return False
     print(f"        ✓ Done")
 
-    # Checkpoint guard: CLDM requires the MLVAE checkpoint saved by step 2.
-    # If it is missing (e.g. due to a silent training failure), warn and abort
-    # rather than letting CLDM crash with a cryptic "model.pt not found" error.
-    mlvae_ckpt_dir = os.path.join(
-        repo_dir, "ckpt", dataset_name, "exp0", "MLVAE"
-    )
+    # Checkpoint guard: search common GOIO checkpoint locations recursively.
+    ckpt_root = os.path.join(repo_dir, "ckpt", dataset_name, "exp0")
     mlvae_ckpt_found = False
-    if os.path.isdir(mlvae_ckpt_dir):
-        mlvae_ckpt_found = any(
-            f.endswith((".pt", ".pth"))
-            for f in os.listdir(mlvae_ckpt_dir)
-            if os.path.isfile(os.path.join(mlvae_ckpt_dir, f))
-        )
+    found_paths = []
+
+    if os.path.isdir(ckpt_root):
+        for root, _, files in os.walk(ckpt_root):
+            root_l = root.lower()
+            if "mlvae" not in root_l:
+                continue
+            for f in files:
+                if f.endswith((".pt", ".pth")):
+                    p = os.path.join(root, f)
+                    if os.path.isfile(p):
+                        mlvae_ckpt_found = True
+                        found_paths.append(p)
+
     if not mlvae_ckpt_found:
         print(
-            f"        ⚠ GOIO checkpoint warning: MLVAE checkpoint not found in "
-            f"{mlvae_ckpt_dir} — CLDM training would fail. Aborting pipeline."
+            f"        ⚠ GOIO checkpoint warning: no MLVAE .pt/.pth found under "
+            f"{ckpt_root} — CLDM training would fail. Aborting pipeline."
         )
         return False
+    else:
+        print(f"        ✓ MLVAE checkpoint found: {found_paths[0]}")
     
     # Step 3: Train CLDM
     print(f"      [3/4] CLDM train...")
