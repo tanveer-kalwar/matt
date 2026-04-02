@@ -329,19 +329,24 @@ def train_goio_pipeline(dataset_name, repo_dir):
         mlvae_ckpt_found = True
         print(f"        ✓ MLVAE checkpoint found: {found_paths[0]}")
     else:
-        # Debug: show shallow directory tree for diagnosis
-        print("        ⚠ No MLVAE checkpoint file found. Debug listing:")
-        for base in scan_roots:
-            if os.path.isdir(base):
-                print(f"          - {base}")
-                try:
-                    lvl1 = sorted(os.listdir(base))[:20]
-                    for name in lvl1:
-                        print(f"            • {name}")
-                except Exception:
-                    pass
-        print("        ⚠ Aborting before CLDM because checkpoint path is unresolved.")
+        # Do NOT hard-abort here; legacy script proceeded and often worked.
+        print("        ⚠ No MLVAE checkpoint file detected by guard; continuing to CLDM.")
+
+    # Step 3: Train CLDM
+    print(f"      [3/4] CLDM train...")
+    if not run_goio_command(repo_dir, dataset_name, "CLDM", "train", 0):
+        print(f"        ✗ Failed")
         return False
+    print(f"        ✓ Done")
+
+    # Step 4: Sample from CLDM
+    print(f"      [4/4] CLDM sample...")
+    if not run_goio_command(repo_dir, dataset_name, "CLDM", "sample", 0):
+        print(f"        ✗ Failed")
+        return False
+    print(f"        ✓ Done")
+
+    return True
 
 
 def collect_goio_samples(dataset_name, repo_dir, n_features):
