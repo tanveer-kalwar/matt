@@ -315,9 +315,12 @@ def train_goio_pipeline(dataset_name, repo_dir):
             # Require mlvae in path OR filename to reduce false positives
             for f in files:
                 fl = f.lower()
-                if not (fl.endswith(".pt") or fl.endswith(".pth") or fl.endswith(".ckpt")):
+                # GOIO may save weights/embeddings with multiple extensions
+                if not (fl.endswith(".pt") or fl.endswith(".pth") or fl.endswith(".ckpt")
+                        or fl.endswith(".npy") or fl.endswith(".npz") or fl.endswith(".pkl")):
                     continue
-                if ("mlvae" in rl) or ("mlvae" in fl):
+                # Prefer MLVAE-tagged paths, but also allow exp0-level saves
+                if ("mlvae" in rl) or ("mlvae" in fl) or ("exp0" in rl and dataset_name.lower() in rl):
                     p = os.path.join(root, f)
                     if os.path.isfile(p):
                         found_paths.append(p)
