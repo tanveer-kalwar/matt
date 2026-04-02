@@ -256,9 +256,17 @@ def run_goio_command(repo_dir, dataname, method, mode, exp=0):
         
         if result.returncode != 0:
             if result.stderr:
-                print(f"        stderr: {result.stderr[-300:]}")
+                print(f"        stderr: {result.stderr[-800:]}")
+            if result.stdout:
+                print(f"        stdout: {result.stdout[-800:]}")
             return False
-        
+
+        # Helpful for silent success/failure cases
+        if method == "MLVAE" and mode == "train":
+            if result.stdout:
+                print(f"        MLVAE stdout tail: {result.stdout[-800:]}")
+            if result.stderr:
+                print(f"        MLVAE stderr tail: {result.stderr[-800:]}")
         return True
         
     except subprocess.TimeoutExpired:
@@ -286,47 +294,51 @@ def train_goio_pipeline(dataset_name, repo_dir):
         return False
     print(f"        ✓ Done")
 
-    # Checkpoint guard: search common GOIO checkpoint locations recursively.
-    ckpt_root = os.path.join(repo_dir, "ckpt", dataset_name, "exp0")
+    # Checkpoint guard: scan likely GOIO output roots for any MLVAE weights
+    scan_roots = [
+        os.path.join(repo_dir, "ckpt", dataset_name),
+        os.path.join(repo_dir, "ckpt"),
+        os.path.join(repo_dir, "checkpoints"),
+        os.path.join(repo_dir, "runs"),
+        os.path.join(repo_dir, "output"),
+        os.path.join(repo_dir, "outputs"),
+    ]
+
     mlvae_ckpt_found = False
     found_paths = []
 
-    if os.path.isdir(ckpt_root):
-        for root, _, files in os.walk(ckpt_root):
-            root_l = root.lower()
-            if "mlvae" not in root_l:
-                continue
+    for base in scan_roots:
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            rl = root.lower()
+            # Require mlvae in path OR filename to reduce false positives
             for f in files:
-                if f.endswith((".pt", ".pth")):
+                fl = f.lower()
+                if not (fl.endswith(".pt") or fl.endswith(".pth") or fl.endswith(".ckpt")):
+                    continue
+                if ("mlvae" in rl) or ("mlvae" in fl):
                     p = os.path.join(root, f)
                     if os.path.isfile(p):
-                        mlvae_ckpt_found = True
                         found_paths.append(p)
 
-    if not mlvae_ckpt_found:
-        print(
-            f"        ⚠ GOIO checkpoint warning: no MLVAE .pt/.pth found under "
-            f"{ckpt_root} — CLDM training would fail. Aborting pipeline."
-        )
-        return False
-    else:
+    if found_paths:
+        mlvae_ckpt_found = True
         print(f"        ✓ MLVAE checkpoint found: {found_paths[0]}")
-    
-    # Step 3: Train CLDM
-    print(f"      [3/4] CLDM train...")
-    if not run_goio_command(repo_dir, dataset_name, "CLDM", "train", 0):
-        print(f"        ✗ Failed")
+    else:
+        # Debug: show shallow directory tree for diagnosis
+        print("        ⚠ No MLVAE checkpoint file found. Debug listing:")
+        for base in scan_roots:
+            if os.path.isdir(base):
+                print(f"          - {base}")
+                try:
+                    lvl1 = sorted(os.listdir(base))[:20]
+                    for name in lvl1:
+                        print(f"            • {name}")
+                except Exception:
+                    pass
+        print("        ⚠ Aborting before CLDM because checkpoint path is unresolved.")
         return False
-    print(f"        ✓ Done")
-    
-    # Step 4: Sample from CLDM
-    print(f"      [4/4] CLDM sample...")
-    if not run_goio_command(repo_dir, dataset_name, "CLDM", "sample", 0):
-        print(f"        ✗ Failed")
-        return False
-    print(f"        ✓ Done")
-    
-    return True
 
 
 def collect_goio_samples(dataset_name, repo_dir, n_features):
