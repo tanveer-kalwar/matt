@@ -1107,9 +1107,9 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             try:
                 # Unique seed per variant to break convergence ties
-                v_idx = list(ABLATION_VARIANTS.keys()).index(variant_name)
-                torch.manual_seed(1234 + v_idx)
-                np.random.seed(1234 + v_idx)
+                # Use same seed as main benchmark
+                torch.manual_seed(42)
+                np.random.seed(42)
 
                 # Create pipeline ONCE with correct flags
                 pipeline = MATDiffPipeline(
@@ -1138,7 +1138,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 # Fixed seed for sampling (same for all variants)
                 torch.manual_seed(1000)   # or any fixed number
                 X_syn_raw, y_syn_raw = pipeline.sample()
-                trained_samples[variant_name] = (X_syn_raw, y_syn_raw)
+                trained_pipelines[variant_name] = pipeline
                 print("✓")
             except Exception as e:
                 print(f"FAILED: {str(e)[:80]}")
@@ -1167,30 +1167,43 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             cc = Counter(y_tr)
             majority_count = max(cc.values())
 
+                    for seed in range(n_seeds):
+            print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
+
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
+            )
+
+            cc = Counter(y_tr)
+            majority_count = max(cc.values())
+
             for variant_name in ABLATION_VARIANTS:
                 if variant_name == "IDENTITY":
                     X_aug, y_aug = X_tr, y_tr
-                elif variant_name in trained_samples:
-                    X_syn_raw, y_syn_raw = trained_samples[variant_name]
-                    X_syn_parts, y_syn_parts = [], []
-                    for c_label, c_count in cc.items():
-                        if c_count < majority_count:
-                            deficit = majority_count - c_count
-                            mask = (y_syn_raw == c_label)
-                            X_c = X_syn_raw[mask][:deficit]
-                            if len(X_c) > 0:
-                                X_syn_parts.append(X_c)
-                                y_syn_parts.append(np.full(len(X_c), c_label))
-                    if X_syn_parts:
-                        X_syn = np.vstack(X_syn_parts)
-                        y_syn = np.concatenate(y_syn_parts)
-                        X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn])
-                    else:
-                        print(f"      Warning: {variant_name} generated no samples for any minority class, using NaNs")
+                elif variant_name in trained_pipelines:
+                    pipeline = trained_pipelines[variant_name]
+                    try:
+                        X_syn_raw, y_syn_raw = pipeline.sample(seed=seed)
+                    except Exception:
                         X_aug, y_aug = None, None
+                    else:
+                        X_syn_parts, y_syn_parts = [], []
+                        for c_label, c_count in cc.items():
+                            if c_count < majority_count:
+                                deficit = majority_count - c_count
+                                mask = (y_syn_raw == c_label)
+                                X_c = X_syn_raw[mask][:deficit]
+                                if len(X_c) > 0:
+                                    X_syn_parts.append(X_c)
+                                    y_syn_parts.append(np.full(len(X_c), c_label))
+                        if X_syn_parts:
+                            X_syn = np.vstack(X_syn_parts)
+                            y_syn = np.concatenate(y_syn_parts)
+                            X_aug = np.vstack([X_tr, X_syn])
+                            y_aug = np.hstack([y_tr, y_syn])
+                        else:
+                            X_aug, y_aug = None, None
                 else:
-                    print(f"      Warning: {variant_name} not trained, using NaNs")
                     X_aug, y_aug = None, None
 
                 if X_aug is None:
@@ -1209,11 +1222,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 for cn in CLF_NAMES:
                     variant_results[variant_name]['F1_per_clf'][cn].append(clf_results[cn]["F1"])
 
-            # Compact per-seed progress line
-            seed_parts = [
-                f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}"
-                for var in ABLATION_VARIANTS
-            ]
+            seed_parts = [f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}" for var in ABLATION_VARIANTS]
             print(" | ".join(seed_parts))
 
         # ────────────────────────────────────────────────────────────
