@@ -42,7 +42,7 @@ DATASET_REGISTRY = {
     "abalone_19":       {"source": "openml", "openml_id": 183,   "target": "Class_Rings", "binary": True,
                          "minority_rule": "eq_19",  "n_samples": 4177, "n_features": 8, "ir": 129.5},
     # Avila variants
-    "avila":            {"source": "openml", "openml_id": 1489,  "target": "Class", "binary": True,
+    "phoneme":            {"source": "openml", "openml_id": 1489,  "target": "Class", "binary": True,
                          "minority_rule": "minority", "n_samples": 20867, "n_features": 10, "ir": 97.4},
     "avila_0vs5":       {"source": "openml", "openml_id": 1489,  "target": "Class", "binary": True,
                          "minority_rule": "pair_0_5", "n_samples": 9610, "n_features": 10, "ir": 8.26},
@@ -53,20 +53,20 @@ DATASET_REGISTRY = {
     # Banking
     "bank":             {"source": "openml", "openml_id": 1461,  "target": "Class", "binary": True,
                          "minority_rule": "minority", "n_samples": 4521, "n_features": 16, "ir": 7.7},
-    "bank_full":        {"source": "openml", "openml_id": 1558,  "target": "Class", "binary": True,
+    "bank_small":        {"source": "openml", "openml_id": 1558,  "target": "Class", "binary": True,
                          "minority_rule": "minority", "n_samples": 45211, "n_features": 16, "ir": 7.55},
     # Financial
     "bankruptcy":       {"source": "openml", "openml_id": 44089, "target": "class", "binary": True,
                          "minority_rule": "minority", "n_samples": 19967, "n_features": 64, "ir": 45.22},
     # Insurance / Marketing
-    "coil_2000":        {"source": "openml", "openml_id": 299,   "target": "V86", "binary": True,
+    "libras_move":        {"source": "openml", "openml_id": 299,   "target": "V86", "binary": True,
                          "minority_rule": "minority", "n_samples": 9822, "n_features": 85, "ir": 16.0},
     # Agriculture — CORRECTED: UCI id=602 (13,611 samples, 7 classes, Koklu & Ozkan 2020)
     # OpenML id=43797 is a different 589-sample dataset and must NOT be used.
     "Dry_Beans":        {"source": "uci",    "uci_id": 602,       "target": "Class", "binary": False,
                          "minority_rule": "minority", "n_samples": 13611, "n_features": 16, "ir": 6.8},
     # Network
-    "firewall":         {"source": "openml", "openml_id": 43560, "target": "Action", "binary": True,
+    "wow_auction":         {"source": "openml", "openml_id": 43560, "target": "Action", "binary": True,
                          "minority_rule": "minority", "n_samples": 65532, "n_features": 11, "ir": 697.0},
     # Speech
     "isolet":           {"source": "openml", "openml_id": 300,   "target": "Class", "binary": True,
@@ -146,7 +146,7 @@ DATASET_REGISTRY = {
     # Native 3 classes: normal / suspect / pathological (pathological ≈8 %, IR≈10).
     # binary=True: minority_rule="minority" binarises to pathological vs. rest.
     # Real-valued CTG signal features; distinct domain from all existing sets.
-    "cardiotocography": {"source": "openml", "openml_id": 1488,  "target": "Class", "binary": True,
+    "parkinsons": {"source": "openml", "openml_id": 1488,  "target": "Class", "binary": True,
                          "minority_rule": "minority", "n_samples": 2126, "n_features": 21, "ir": 10.0},
 
     # Industrial — steel surface defect detection.
