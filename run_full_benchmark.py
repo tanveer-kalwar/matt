@@ -1133,7 +1133,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
                 # Force early evaluation to capture the impact of components
                 # 150 epochs is typically the 'elbow' where spectral advantage is visible
-                pipeline.fit(X_tr_80, y_tr_80, epochs=150, batch_size=cfg["batch_size"], verbose=False)
+                pipeline.fit(X_tr_80, y_tr_80, epochs=cfg["epochs"], batch_size=cfg["batch_size"], verbose=False)
 
                 # Fixed seed for sampling (same for all variants)
                 torch.manual_seed(1000)   # or any fixed number
@@ -1166,35 +1166,40 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             cc = Counter(y_tr)
             majority_count = max(cc.values())
-            minority_label = min(cc, key=cc.get)
-            needed = majority_count - cc[minority_label]
 
             for variant_name in ABLATION_VARIANTS:
                 if variant_name == "IDENTITY":
                     X_aug, y_aug = X_tr, y_tr
                 elif variant_name in trained_samples:
                     X_syn_raw, y_syn_raw = trained_samples[variant_name]
-                    mask = (y_syn_raw == minority_label)
-                    X_syn = X_syn_raw[mask][:needed]
-                    y_syn_part = np.full(len(X_syn), minority_label)
-                    if len(X_syn) > 0:
+                    X_syn_parts, y_syn_parts = [], []
+                    for c_label, c_count in cc.items():
+                        if c_count < majority_count:
+                            deficit = majority_count - c_count
+                            mask = (y_syn_raw == c_label)
+                            X_c = X_syn_raw[mask][:deficit]
+                            if len(X_c) > 0:
+                                X_syn_parts.append(X_c)
+                                y_syn_parts.append(np.full(len(X_c), c_label))
+                    if X_syn_parts:
+                        X_syn = np.vstack(X_syn_parts)
+                        y_syn = np.concatenate(y_syn_parts)
                         X_aug = np.vstack([X_tr, X_syn])
-                        y_aug = np.hstack([y_tr, y_syn_part])
+                        y_aug = np.hstack([y_tr, y_syn])
                     else:
-                        print(f"      Warning: {variant_name} generated no samples for class {minority_label}, using NaNs")
+                        print(f"      Warning: {variant_name} generated no samples for any minority class, using NaNs")
                         X_aug, y_aug = None, None
                 else:
                     print(f"      Warning: {variant_name} not trained, using NaNs")
                     X_aug, y_aug = None, None
 
                 if X_aug is None:
-                    # Create dummy results with NaNs
                     clf_results = {cn: {m: np.nan for m in UTIL_METRICS} for cn in CLF_NAMES}
                 else:
                     X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=1.0, neginf=0.0)
                     clf_results = evaluate_utility(X_aug, y_aug, X_te, y_te, seed=seed)
 
-                f1_avg  = np.mean([clf_results[cn]["F1"]  for cn in CLF_NAMES])
+                f1_avg = np.mean([clf_results[cn]["F1"] for cn in CLF_NAMES])
                 acc_avg = np.mean([clf_results[cn]["Acc"] for cn in CLF_NAMES])
                 mcc_avg = np.mean([clf_results[cn]["MCC"] for cn in CLF_NAMES])
 
@@ -1202,8 +1207,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 variant_results[variant_name]['Acc'].append(acc_avg)
                 variant_results[variant_name]['MCC'].append(mcc_avg)
                 for cn in CLF_NAMES:
-                    variant_results[variant_name]['F1_per_clf'][cn].append(
-                        clf_results[cn]["F1"])
+                    variant_results[variant_name]['F1_per_clf'][cn].append(clf_results[cn]["F1"])
 
             # Compact per-seed progress line
             seed_parts = [
