@@ -1009,15 +1009,9 @@ def run_benchmark(datasets, device, n_seeds, n_folds, matdiff_epochs_override=No
 def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
     """
     Ablation: Train once on 80% data, evaluate n_seeds times.
-    Same protocol as DGOT Table IX. IDENTICAL model for 'MAT-Diff (Ours)'.
-    Each ablation removes EXACTLY ONE component.
-
-    Output format:
-        Summary table:   Variant | F1 mean ± std | Acc mean ± std | MCC mean ± std
-        Classifier table: Variant | XGB mean±std | DTC mean±std | ...
-        Final pivot:      Dataset columns, Variant rows, "0.XXXX ± 0.XXXX" values
+    Same protocol as main benchmark (same seeds, per‑seed sampling,
+    all minority classes balanced).
     """
-    # Import here to avoid circular imports when used as standalone
     from mat_diff.config import get_matdiff_config
     from mat_diff.data_fetcher import load_dataset
     from mat_diff.manifold_diffusion import MATDiffPipeline
@@ -1054,22 +1048,15 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             continue
 
         cfg = get_matdiff_config(ds_name)
-        FIXED_EPOCHS = cfg["epochs"]
 
-        # Train 80% split (seed=42) — same as benchmark protocol
+        # Fixed 80% training split (same as main benchmark)
         X_tr_80, _, y_tr_80, _ = train_test_split(
             X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
         )
 
-        # Compute minority count for adaptive configuration
-        from collections import Counter
-        cc_80 = Counter(y_tr_80)
-        minority_count_80 = min(cc_80.values())
-
         print(f"\n  [TRAINING PHASE - Train each variant once on {len(X_tr_80)} samples]")
 
-        # Train all variants ONCE and store their synthetic samples
-        trained_samples = {}  # variant_name -> (X_syn, y_syn)
+        trained_pipelines = {}  # variant_name -> pipeline object
 
         for variant_name in ABLATION_VARIANTS:
             if variant_name == "IDENTITY":
@@ -1077,41 +1064,31 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
 
             print(f"    [{variant_name}] Training...", end=" ", flush=True)
 
-            # Fixed baseline for ablations (full model)
-            baseline_fisher = True
-            baseline_spectral = True
-            baseline_dmf = True
-
+            # Set flags for this variant
             if variant_name == "MAT-Diff (Ours)":
-                # Adaptive: enable spectral and DMF only if minority count >= 300
                 use_fisher_weights = True
                 use_spectral = True
                 use_dmf = True
             elif variant_name == "w/o Fisher":
                 use_fisher_weights = False
-                use_spectral = baseline_spectral
-                use_dmf = baseline_dmf
+                use_spectral = True
+                use_dmf = True
             elif variant_name == "w/o Spectral":
-                use_fisher_weights = baseline_fisher
+                use_fisher_weights = True
                 use_spectral = False
-                use_dmf = baseline_dmf
+                use_dmf = True
             elif variant_name == "w/o DMF":
-                use_fisher_weights = baseline_fisher
-                use_spectral = baseline_spectral
+                use_fisher_weights = True
+                use_spectral = True
                 use_dmf = False
             else:
-                # Should not happen
-                use_fisher_weights = baseline_fisher
-                use_spectral = baseline_spectral
-                use_dmf = baseline_dmf
+                continue
 
             try:
-                # Unique seed per variant to break convergence ties
-                # Use same seed as main benchmark
+                # Use the same seed as main benchmark (42) for reproducibility
                 torch.manual_seed(42)
                 np.random.seed(42)
 
-                # Create pipeline ONCE with correct flags
                 pipeline = MATDiffPipeline(
                     device=device,
                     d_model=cfg["d_model"],
@@ -1125,30 +1102,24 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                     weight_decay=cfg.get("weight_decay", 1e-5),
                     privacy_quantile=cfg.get("privacy_quantile", 0.05),
                 )
-                
-                # Set flags AFTER creation
                 pipeline.use_fisher_weights = use_fisher_weights
                 pipeline.use_spectral = use_spectral
                 pipeline.use_dmf = use_dmf
 
-                # Force early evaluation to capture the impact of components
-                # 150 epochs is typically the 'elbow' where spectral advantage is visible
-                pipeline.fit(X_tr_80, y_tr_80, epochs=cfg["epochs"], batch_size=cfg["batch_size"], verbose=False)
+                # Use dataset‑specific epochs (same as main benchmark)
+                pipeline.fit(X_tr_80, y_tr_80, epochs=cfg["epochs"],
+                             batch_size=cfg["batch_size"], verbose=False)
 
-                # Fixed seed for sampling (same for all variants)
-                torch.manual_seed(1000)   # or any fixed number
-                X_syn_raw, y_syn_raw = pipeline.sample()
                 trained_pipelines[variant_name] = pipeline
                 print("✓")
             except Exception as e:
                 print(f"FAILED: {str(e)[:80]}")
 
-        # ── Evaluate all variants on n_seeds different 80/20 splits ──
+        # ──────────────────────────────────────────────────────────────
+        # EVALUATION PHASE: 10 different 80/20 splits, per‑seed sampling
+        # ──────────────────────────────────────────────────────────────
         print(f"\n  [EVALUATION PHASE - {n_seeds} different 80/20 splits]")
 
-        # Storage: per variant, list of per-seed scalars
-        # variant_results[var]['F1'] = [seed0, seed1, ..., seed9]
-        # variant_results[var]['F1_per_clf'][clf] = [seed0, ..., seed9]
         variant_results = {
             var: {
                 'F1': [], 'Acc': [], 'MCC': [],
@@ -1156,7 +1127,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             }
             for var in ABLATION_VARIANTS
         }
-        
+
         for seed in range(n_seeds):
             print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
 
@@ -1173,10 +1144,13 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 elif variant_name in trained_pipelines:
                     pipeline = trained_pipelines[variant_name]
                     try:
+                        # Sample fresh synthetic data for this seed
                         X_syn_raw, y_syn_raw = pipeline.sample(seed=seed)
-                    except Exception:
+                    except Exception as e:
+                        print(f"\n      Warning: {variant_name} sampling failed: {e}")
                         X_aug, y_aug = None, None
                     else:
+                        # Balance ALL minority classes (same as main benchmark)
                         X_syn_parts, y_syn_parts = [], []
                         for c_label, c_count in cc.items():
                             if c_count < majority_count:
@@ -1192,6 +1166,7 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                             X_aug = np.vstack([X_tr, X_syn])
                             y_aug = np.hstack([y_tr, y_syn])
                         else:
+                            print(f"\n      Warning: {variant_name} generated no minority samples for this split")
                             X_aug, y_aug = None, None
                 else:
                     X_aug, y_aug = None, None
@@ -1212,35 +1187,36 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
                 for cn in CLF_NAMES:
                     variant_results[variant_name]['F1_per_clf'][cn].append(clf_results[cn]["F1"])
 
-            seed_parts = [f"{var[:10]}={variant_results[var]['F1'][-1]:.3f}" for var in ABLATION_VARIANTS]
-            print(" | ".join(seed_parts))
+            # Print progress line (only variants with valid F1)
+            seed_parts = []
+            for var in ABLATION_VARIANTS:
+                if variant_results[var]['F1']:
+                    last = variant_results[var]['F1'][-1]
+                    if not np.isnan(last):
+                        seed_parts.append(f"{var[:10]}={last:.3f}")
+            print(" | ".join(seed_parts) if seed_parts else "All NaNs")
 
-        # ────────────────────────────────────────────────────────────
-        # Summary with ± values (mean ± std across 10 seeds)
-        # This is the IEEE TKDE format used by DGOT, GOIO, and others.
-        # ────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────
+        # SUMMARY TABLES (mean ± std across seeds)
+        # ──────────────────────────────────────────────────────────────
         print(f"\n  [Dataset Summary — mean ± std across {n_seeds} seeds × 5 classifiers]")
         print(f"    {'Variant':<20s} {'F1':>16s}  {'Acc':>16s}  {'MCC':>16s}")
         print(f"    {'─'*20} {'─'*16}  {'─'*16}  {'─'*16}")
 
         for variant_name in ABLATION_VARIANTS:
-            f1_vals  = variant_results[variant_name]['F1']
+            f1_vals = variant_results[variant_name]['F1']
             acc_vals = variant_results[variant_name]['Acc']
             mcc_vals = variant_results[variant_name]['MCC']
 
-            f1_mean,  f1_std  = np.mean(f1_vals),  np.std(f1_vals)
-            acc_mean, acc_std = np.mean(acc_vals), np.std(acc_vals)
-            mcc_mean, mcc_std = np.mean(mcc_vals), np.std(mcc_vals)
+            if f1_vals:
+                f1_mean, f1_std = np.mean(f1_vals), np.std(f1_vals)
+                acc_mean, acc_std = np.mean(acc_vals), np.std(acc_vals)
+                mcc_mean, mcc_std = np.mean(mcc_vals), np.std(mcc_vals)
+            else:
+                f1_mean = f1_std = acc_mean = acc_std = mcc_mean = mcc_std = np.nan
 
-            f1_str  = f"{f1_mean:.4f} ± {f1_std:.4f}"
-            acc_str = f"{acc_mean:.4f} ± {acc_std:.4f}"
-            mcc_str = f"{mcc_mean:.4f} ± {mcc_std:.4f}"
+            print(f"    {variant_name:<20s} {f1_mean:.4f} ± {f1_std:.4f}  {acc_mean:.4f} ± {acc_std:.4f}  {mcc_mean:.4f} ± {mcc_std:.4f}")
 
-            print(f"    {variant_name:<20s} {f1_str:>16s}  {acc_str:>16s}  {mcc_str:>16s}")
-
-        # ────────────────────────────────────────────────────────────
-        # Per-classifier breakdown with ± values
-        # ────────────────────────────────────────────────────────────
         print(f"\n  [Per-Classifier F1 — mean ± std across {n_seeds} seeds]")
         clf_col_w = 16
         header = f"    {'Variant':<20s}"
@@ -1253,41 +1229,39 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             row = f"    {variant_name:<20s}"
             for cn in CLF_NAMES:
                 vals = variant_results[variant_name]['F1_per_clf'][cn]
-                m, s = np.mean(vals), np.std(vals)
-                row += f" {f'{m:.4f}±{s:.4f}':>{clf_col_w}s}"
+                if vals:
+                    m, s = np.mean(vals), np.std(vals)
+                    row += f" {f'{m:.4f}±{s:.4f}':>{clf_col_w}s}"
+                else:
+                    row += f" {'nan±nan':>{clf_col_w}s}"
             print(row)
 
-        # Store results
+        # Store results for final pivot
         for variant_name in ABLATION_VARIANTS:
-            f1_vals  = variant_results[variant_name]['F1']
+            f1_vals = variant_results[variant_name]['F1']
             acc_vals = variant_results[variant_name]['Acc']
             mcc_vals = variant_results[variant_name]['MCC']
-
-            # Also compute per-classifier means and stds for CSV
             clf_means = {}
-            clf_stds  = {}
+            clf_stds = {}
             for cn in CLF_NAMES:
                 vals = variant_results[variant_name]['F1_per_clf'][cn]
                 clf_means[cn] = np.mean(vals) if vals else np.nan
-                clf_stds[cn]  = np.std(vals)  if vals else np.nan
+                clf_stds[cn] = np.std(vals) if vals else np.nan
 
             all_results.append({
-                "Dataset":    ds_name,
-                "Variant":    variant_name,
-                "F1_Mean":    np.mean(f1_vals),
-                "F1_Std":     np.std(f1_vals),
-                "Acc_Mean":   np.mean(acc_vals),
-                "Acc_Std":    np.std(acc_vals),
-                "MCC_Mean":   np.mean(mcc_vals),
-                "MCC_Std":    np.std(mcc_vals),
-                # Per-classifier F1
+                "Dataset": ds_name,
+                "Variant": variant_name,
+                "F1_Mean": np.mean(f1_vals) if f1_vals else np.nan,
+                "F1_Std": np.std(f1_vals) if f1_vals else np.nan,
+                "Acc_Mean": np.mean(acc_vals) if acc_vals else np.nan,
+                "Acc_Std": np.std(acc_vals) if acc_vals else np.nan,
+                "MCC_Mean": np.mean(mcc_vals) if mcc_vals else np.nan,
+                "MCC_Std": np.std(mcc_vals) if mcc_vals else np.nan,
                 **{f"F1_{cn}_Mean": clf_means[cn] for cn in CLF_NAMES},
-                **{f"F1_{cn}_Std":  clf_stds[cn]  for cn in CLF_NAMES},
+                **{f"F1_{cn}_Std": clf_stds[cn] for cn in CLF_NAMES},
             })
 
-    # ────────────────────────────────────────────────────────────────
-    # Final summary pivot table: "mean ± std" cells
-    # ────────────────────────────────────────────────────────────────
+    # Final pivot tables
     if all_results:
         df = pd.DataFrame(all_results)
         df.to_csv("ablation_results.csv", index=False)
@@ -1296,7 +1270,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         print("ABLATION SUMMARY  (F1: mean ± std across 10 evaluation seeds)")
         print("=" * 120)
 
-        # Build pivot with formatted "mean ± std" strings
         pivot_data = {}
         order = ["IDENTITY", "w/o Fisher", "w/o Spectral", "w/o DMF", "MAT-Diff (Ours)"]
 
@@ -1312,7 +1285,6 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
         print(pivot_df.to_string())
         print("=" * 120)
 
-        # Also print a clean numeric-only pivot for quick comparison
         print("\nNUMERIC PIVOT (F1 mean only — for quick ranking)")
         print("=" * 120)
         pivot_num = df.pivot(index="Variant", columns="Dataset", values="F1_Mean")
