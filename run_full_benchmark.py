@@ -1156,18 +1156,8 @@ def run_ablation_study(datasets, device, n_seeds=10, n_folds=5):
             }
             for var in ABLATION_VARIANTS
         }
-
+        
         for seed in range(n_seeds):
-            print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
-
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X_all, y_all, test_size=0.2, random_state=seed, stratify=y_all
-            )
-
-            cc = Counter(y_tr)
-            majority_count = max(cc.values())
-
-                    for seed in range(n_seeds):
             print(f"    Seed {seed+1}/{n_seeds}: ", end="", flush=True)
 
             X_tr, X_te, y_tr, y_te = train_test_split(
